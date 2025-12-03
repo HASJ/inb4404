@@ -1,0 +1,10 @@
+*.webm
+*.mp4
+*.jpg
+*.webp
+*.png
+*.gif
+links.txt
+*.pyc
+.hashes.txt
+hashes.db
