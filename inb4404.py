@@ -245,6 +245,22 @@ def call_download_thread(thread_link, args):
     # Process target should be a picklable callable; this thin wrapper lets
     # the child process run `download_thread` and simply ignores
     # KeyboardInterrupt so cleanup can proceed gracefully in the parent.
+    # Ensure logging is configured in spawned child processes so that
+    # per-file download messages are emitted to the console when the
+    # script is run in "file of links" mode (multiprocessing spawn
+    # on Windows doesn't inherit the parent's basicConfig). Use the
+    # same date format selection as the main process.
+    try:
+        if getattr(args, 'date', False):
+            logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %I:%M:%S %p')
+        else:
+            logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%I:%M:%S %p')
+    except Exception:
+        # If logging config fails for any reason, continue anyway and
+        # rely on direct prints inside download_thread (log calls are
+        # still used elsewhere).
+        pass
+
     try:
         download_thread(thread_link, args)
     except KeyboardInterrupt:
@@ -282,15 +298,11 @@ def download_thread(thread_link, args):
     # fallback (which sets all_titles) isn't executed.
     all_titles = []
 
-    # --- MD5 Hashing Logic (per-thread + global DB) ---
-    # The script maintains two sources of truth for duplicate detection:
-    # 1) A per-thread file ('.hashes.txt') containing MD5 hashes for files
-    #    already saved for that thread.
-    # 2) A global `hashes.txt` in the repository root mapping MD5 -> saved_path
-    #    to avoid saving duplicates across threads. The code below reads both
-    #    structures into memory and will persist updates as files are
-    #    discovered.
-    hash_file_path = os.path.join(directory, '.hashes.txt')
+    # --- MD5 Hashing Logic (per-thread now stored in SQLite DB) ---
+    # Per-thread hashes are now queried from the `hashes` table (column
+    # `thread`) instead of using a per-thread `.hashes.txt` file. Existing
+    # files in the thread directory are scanned and inserted into the DB as
+    # needed. Legacy `.hashes.txt` files are removed when found.
     md5_hashes = set()
 
     # Initialize SQLite-backed global hash DB (replaces the previous
@@ -308,45 +320,52 @@ def download_thread(thread_link, args):
         except Exception:
             log.info('No global hash DB found. It will be created as files are downloaded.')
 
+    # Load per-thread hashes from DB if present
     try:
-        with open(hash_file_path, 'r', encoding='utf-8') as f:
-            md5_hashes.update(line.strip() for line in f if line.strip())
+        conn_tmp = sqlite3.connect(DB_PATH, timeout=30)
+        cur_tmp = conn_tmp.cursor()
+        cur_tmp.execute('SELECT md5 FROM hashes WHERE thread=?', (thread,))
+        rows = cur_tmp.fetchall()
+        md5_hashes.update(r[0] for r in rows if r and r[0])
+        conn_tmp.close()
         if args.verbose:
-            log.info('Loaded ' + str(len(md5_hashes)) + ' hashes from ' + hash_file_path)
-    except (IOError, FileNotFoundError):
+            log.info('Loaded ' + str(len(md5_hashes)) + ' per-thread hashes from DB for ' + board + '/' + thread)
+    except Exception:
+        md5_hashes = set()
         if args.verbose:
-            log.info('No per-thread hash file found. Generating from existing files and pruning duplicates...')
-        for filename in os.listdir(directory):
-            full_path = os.path.join(directory, filename)
-            if os.path.isfile(full_path) and not filename == '.hashes.txt':
-                file_hash = get_md5(full_path)
-                if not file_hash:
-                    continue
-                # If this hash already exists globally and points to a different file, remove the duplicate
-                gpath = get_md5_path(file_hash)
-                if gpath and os.path.abspath(gpath) != os.path.abspath(full_path):
-                    try:
-                        os.remove(full_path)
-                        if args.verbose:
-                            log.info('Removed duplicate file: ' + full_path + ' (duplicate of ' + gpath + ')')
-                        continue
-                    except OSError as e:
-                        log.warning('Could not remove duplicate file ' + full_path + ': ' + str(e))
-                md5_hashes.add(file_hash)
-                # Ensure global has this entry
-                insert_md5(file_hash, full_path, thread)
-        # write per-thread hashes
-        try:
-            with open(hash_file_path, 'w', encoding='utf-8') as f:
-                for h in sorted(list(md5_hashes)):
-                    f.write(h + '\n')
-            if args.verbose and md5_hashes:
-                log.info('Saved ' + str(len(md5_hashes)) + ' initial hashes to ' + hash_file_path)
-        except IOError as e:
-            log.error('Could not write initial hash file: ' + str(e))
+            log.info('No per-thread hashes in DB for ' + board + '/' + thread + '. Scanning directory for existing files...')
 
-        # The global state is persisted incrementally to the SQLite DB as new
-        # files are downloaded; no one-time dump to a text file is necessary.
+    # Scan the thread directory and integrate any existing files into the
+    # per-thread set and the global DB. Also remove legacy `.hashes.txt`.
+    for filename in os.listdir(directory):
+        full_path = os.path.join(directory, filename)
+        if os.path.isfile(full_path):
+            if filename == '.hashes.txt':
+                # remove legacy file
+                try:
+                    os.remove(full_path)
+                    if args.verbose:
+                        log.info('Removed legacy .hashes.txt in ' + directory)
+                except Exception:
+                    pass
+                continue
+            file_hash = get_md5(full_path)
+            if not file_hash:
+                continue
+            # If this hash already exists globally and points to a different file, remove the duplicate
+            gpath = get_md5_path(file_hash)
+            if gpath and os.path.abspath(gpath) != os.path.abspath(full_path):
+                try:
+                    os.remove(full_path)
+                    if args.verbose:
+                        log.info('Removed duplicate file: ' + full_path + ' (duplicate of ' + gpath + ')')
+                    continue
+                except OSError as e:
+                    log.warning('Could not remove duplicate file ' + full_path + ': ' + str(e))
+            md5_hashes.add(file_hash)
+            # Ensure global DB has this entry
+            insert_md5(file_hash, full_path, thread)
+
     # --- End MD5 Hashing Logic ---
 
     # Main polling loop: repeatedly fetch thread metadata, check for new
@@ -467,13 +486,15 @@ def download_thread(thread_link, args):
                     # Check the SQLite-backed global DB for known MD5s first
                     gpath = get_md5_path(api_md5_hex)
                     if gpath:
+                        # Don't spam INFO for duplicates; use DEBUG so only users
+                        # requesting debug-level output see the details.
                         if args.verbose:
-                            log.info('Duplicate (global API md5) skipping %s (MD5: %s)', img, api_md5_hex)
+                            log.debug('Duplicate (global API md5) skipping %s (MD5: %s)', img, api_md5_hex)
                         count += 1
                         continue
                     if api_md5_hex in md5_hashes:
                         if args.verbose:
-                            log.info('Duplicate (thread API md5) skipping %s (MD5: %s)', img, api_md5_hex)
+                            log.debug('Duplicate (thread API md5) skipping %s (MD5: %s)', img, api_md5_hex)
                         count += 1
                         continue
 
@@ -481,12 +502,15 @@ def download_thread(thread_link, args):
                 # indicate a duplicate. `link` may be protocol-relative
                 # (starting with '//') so normalize it to a full URL when
                 # necessary.
+                # Reduce noisy output: only emit a concise INFO when a new
+                # file is actually saved below. Use DEBUG for pre-download
+                # details so users can enable verbose logging explicitly.
                 if getattr(args, 'verbose', False):
                     display_save = (locals().get('chosen_name') or os.path.basename(img_path))
                     try:
-                        log.info(f'Downloading {display_save} from {board}/{thread} (url: {link})')
+                        log.debug(f'Downloading {display_save} from {board}/{thread} (url: {link})')
                     except Exception:
-                        log.info('Downloading file from %s/%s', board, thread)
+                        log.debug('Downloading file from %s/%s', board, thread)
                 # Skip items where the link is missing to avoid calling startswith on None
                 if not link:
                     if getattr(args, 'verbose', False):
@@ -502,16 +526,19 @@ def download_thread(thread_link, args):
                 # Double-check after download (consult per-thread set and
                 # the SQLite-backed global DB).
                 if data_hash in md5_hashes or has_md5(data_hash):
+                    # Avoid printing duplicate notices at INFO level; keep them
+                    # at DEBUG so normal runs only show newly saved files.
                     if args.verbose:
-                        log.info('Duplicate found after download (MD5: %s), skipping %s', data_hash, img or '')
+                        log.debug('Duplicate found after download (MD5: %s), skipping %s', data_hash, img or '')
                     count += 1
                     continue
 
-                output_text = board + '/' + thread + '/' + img
+                # Emit a single, concise INFO line only for newly saved files.
+                filename_only = os.path.basename(img_path) or (img or '')
                 if args.with_counter:
-                    output_text = '[' + str(count).rjust(len(str(total))) +  '/' + str(total) + '] ' + output_text
-
-                log.info(output_text)
+                    log.info('[%s/%s] NEW: %s/%s', str(count).rjust(len(str(total))), total, board + '/' + thread, filename_only)
+                else:
+                    log.info('NEW: %s/%s', board + '/' + thread, filename_only)
 
                 with open(img_path, 'wb') as f:
                     f.write(data)
@@ -520,11 +547,6 @@ def download_thread(thread_link, args):
                 # persist the global mapping into the SQLite DB.
                 md5_hashes.add(data_hash)
                 insert_md5(data_hash, img_path, thread)
-                try:
-                    with open(hash_file_path, 'a', encoding='utf-8') as f:
-                        f.write(data_hash + '\n')
-                except IOError as e:
-                    log.warning('Could not append to hash file: ' + str(e))
 
                 # Also copy the file into the `new/` directory layout so that
                 # external tools can easily pick up newly downloaded images.
@@ -778,12 +800,11 @@ def dedupe_downloads():
     if verbose:
         log.info(f'Found {sum(len(v) for v in md5_map.values())} files, {len(md5_map)} unique hashes')
 
-    # For each hash with multiples, keep the oldest and delete duplicates
+    # For each hash group, keep the oldest file and delete duplicates.
+    # Also ensure the DB references the kept path for every hash.
     deleted_count = 0
     kept_count = 0
     for h, paths in md5_map.items():
-        if len(paths) <= 1:
-            continue
         # sort by mtime ascending (oldest first)
         paths_sorted = sorted(paths, key=lambda p: os.path.getmtime(p))
         kept = paths_sorted[0]
@@ -806,35 +827,16 @@ def dedupe_downloads():
 
     log.info('Dedupe complete. Kept {} groups, removed {} files'.format(kept_count, deleted_count))
 
-    # Rebuild per-thread .hashes.txt files from remaining files
-    for board_dir in os.listdir(downloads_root):
-        board_path = os.path.join(downloads_root, board_dir)
-        if not os.path.isdir(board_path):
-            continue
-        for thread_dir in os.listdir(board_path):
-            thread_path = os.path.join(board_path, thread_dir)
-            if not os.path.isdir(thread_path):
-                continue
-            hashes = []
-            for fn in os.listdir(thread_path):
-                if fn == '.hashes.txt':
-                    continue
-                fpath = os.path.join(thread_path, fn)
-                if not os.path.isfile(fpath):
-                    continue
-                h = get_md5(fpath)
-                if h:
-                    hashes.append(h)
-                if verbose:
-                    log.info(f'Hash for {fpath}: {h}')
-            hashes_file = os.path.join(thread_path, '.hashes.txt')
-            try:
-                with open(hashes_file, 'w', encoding='utf-8') as hf:
-                    for hh in sorted(hashes):
-                        hf.write(hh + '\n')
-                log.info('Wrote {} hashes to {}'.format(len(hashes), hashes_file))
-            except Exception as e:
-                log.warning('Could not write {}: {}'.format(hashes_file, str(e)))
+    # Remove any legacy per-thread .hashes.txt files (DB now stores per-thread hashes)
+    for root, dirs, files in os.walk(downloads_root):
+        for fn in files:
+            if fn == '.hashes.txt':
+                fp = os.path.join(root, fn)
+                try:
+                    os.remove(fp)
+                    log.info('Removed legacy file: ' + fp)
+                except Exception as e:
+                    log.warning('Could not remove legacy .hashes.txt ' + fp + ': ' + str(e))
 
 
 if __name__ == '__main__':
