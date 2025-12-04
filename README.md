@@ -1,6 +1,6 @@
 # inb4404 - 4chan Thread Downloader
 
-`inb4404` is a lightweight, command-line utility for watching and downloading media from 4chan-style imageboard threads. It is designed to be efficient and resilient, making it easy to archive threads automatically.
+`inb4404` is a fork from Exceen/4chan-downloader, a lightweight, command-line utility for watching and downloading media from 4chan-style imageboard threads. It is designed to be efficient and resilient, making it easy to archive threads automatically.
 
 ## Features
 
@@ -20,21 +20,23 @@
 - No external libraries are required for basic functionality.
 
 For the optional `--title` feature (to save files with their original post title), the following libraries are needed:
+
 - `beautifulsoup4`
 - `django` (used for `get_valid_filename`)
 
 ## Installation
 
-1.  Clone this repository:
-    ```bash
-    git clone <repository-url>
-    cd inb4404
-    ```
+1. Clone this repository:
 
-2.  (Optional) To use the `--title` feature, install the required libraries:
-    ```bash
-    pip install beautifulsoup4 django
-    ```
+   ```bash
+   git clone <repository-url>
+   cd inb4404
+   ```
+2. (Optional) To use the `--title` feature, install the required libraries:
+
+   ```bash
+   pip install beautifulsoup4 django
+   ```
 
 ## Usage
 
@@ -49,23 +51,26 @@ python inb4404.py <thread-url>
 ```
 
 **Example:**
+
 ```bash
 python inb4404.py https://boards.4chan.org/wg/thread/7654321
 ```
 
 ### Watching Multiple Threads
 
-1.  Create a text file (e.g., `threads.txt`).
-2.  Add one thread URL per line.
-3.  Run the script with the filename as the argument.
+1. Create a text file (e.g., `threads.txt`).
+2. Add one thread URL per line.
+3. Run the script with the filename as the argument.
 
 **Example `threads.txt`:**
+
 ```
 https://boards.4chan.org/wg/thread/7654321
 https://boards.4chan.org/hr/thread/1234567
 ```
 
 **Run the script:**
+
 ```bash
 python inb4404.py threads.txt
 ```
@@ -76,21 +81,22 @@ By default, the script will only process the file once. Use the `--reload` flag 
 
 Here are some of the most common options:
 
-| Argument | Description |
-|---|---|
-| `thread` | The URL of the thread to watch, or a path to a file containing a list of URLs. |
-| `-c`, `--with-counter` | Show a download counter (`[1/100]`). |
-| `-d`, `--date` | Show the date in the log output. |
-| `-v`, `--verbose` | Show more detailed logging information. |
-| `-n`, `--use-names` | Use thread names for directory paths instead of thread IDs. |
-| `-r`, `--reload` | Reload the queue file every 5 minutes for new or removed threads. |
-| `-t`, `--title` | Save files using the post's title as the filename (requires optional libraries). |
-| `--origin-name` | Save files using the original filename given on the board. |
-| `--refresh-time SEC` | Time in seconds to wait before refreshing a thread (default: 20). |
-| `--throttle SEC` | Delay in seconds between downloads within the same thread (default: 0.5). |
-| `--dedupe-downloads`| Run a scan of the `downloads` directory to find and remove duplicate files, then exit. |
+| Argument                   | Description                                                                              |
+| -------------------------- | ---------------------------------------------------------------------------------------- |
+| `thread`                 | The URL of the thread to watch, or a path to a file containing a list of URLs.           |
+| `-c`, `--with-counter` | Show a download counter (`[1/100]`).                                                   |
+| `-d`, `--date`         | Show the date in the log output.                                                         |
+| `-v`, `--verbose`      | Show more detailed logging information.                                                  |
+| `-n`, `--use-names`    | Use thread names for directory paths instead of thread IDs.                              |
+| `-r`, `--reload`       | Reload the queue file every 5 minutes for new or removed threads.                        |
+| `-t`, `--title`        | Save files using the post's title as the filename (requires optional libraries).         |
+| `--origin-name`          | Save files using the original filename given on the board.                               |
+| `--refresh-time SEC`     | Time in seconds to wait before refreshing a thread (default: 20).                        |
+| `--throttle SEC`         | Delay in seconds between downloads within the same thread (default: 0.5).                |
+| `--dedupe-downloads`     | Run a scan of the `downloads` directory to find and remove duplicate files, then exit. |
 
 For a full list of commands, run:
+
 ```bash
 python inb4404.py --help
 ```
