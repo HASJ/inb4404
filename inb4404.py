@@ -159,6 +159,7 @@ def main():
     parser.add_argument('-n', '--use-names', action='store_true', help='use thread names instead of the thread ids (...4chan.org/board/thread/thread-id/thread-name)')
     parser.add_argument('-r', '--reload', action='store_true', help='reload the queue file every 5 minutes')
     parser.add_argument('-t', '--title', action='store_true', help='save original filenames')
+    parser.add_argument(      '--subject', action='store_true', help='use thread subject in directory name')
     parser.add_argument(      '--new-dir', action='store_true', help='create the `new` directory')
     parser.add_argument(      '--refresh-time', type=float, default=20, help='Delay in seconds before refreshing the thread')
     parser.add_argument(      '--reload-time', type=float, default=5, help='Delay in minutes before reloading the file. Default: 5')
