@@ -23,6 +23,7 @@ import fileinput
 import hashlib
 import json
 import base64
+import html
 from multiprocessing import Process
 
 log = logging.getLogger('inb4404')
@@ -238,6 +239,86 @@ def load(url):
     })
     return urllib.request.urlopen(req).read()
 
+def clean_filename(s):
+    """Sanitize a string to be safe for use as a filename.
+
+    Removes non-word characters (except for dots, dashes, and spaces) and
+    replaces spaces with underscores if Django is not available.
+
+    Args:
+        s (str): The string to sanitize.
+
+    Returns:
+        str: The sanitized filename.
+    """
+    try:
+        from django.utils.text import get_valid_filename  # prefer Django if available
+        return get_valid_filename(s)
+    except ImportError:
+        s = str(s).strip()
+        # remove characters that are not word chars, dot, dash or space
+        s = re.sub(r'(?u)[^-\w.\s]', '', s)
+        # replace spaces with underscores to produce a safe filename
+        s = s.replace(' ', '_')
+        if not s:
+            s = 'file'
+        return s
+
+
+def get_thread_subject(board, thread_id):
+    """Retrieve the subject of a thread (or a comment snippet).
+
+    Attempts to fetch the thread via the 4chan JSON API first. If successful,
+    returns the 'sub' (subject) field if present, or a snippet of the 'com'
+    (comment) field. If the API fails, attempts to scrape the subject from
+    the HTML.
+
+    Args:
+        board (str): The board identifier (e.g., 'g', 'wg').
+        thread_id (str): The numeric thread ID.
+
+    Returns:
+        str or None: The sanitized subject/snippet, or None if retrieval failed.
+    """
+    # 1. Try JSON API
+    try:
+        api_url = f'https://a.4cdn.org/{board}/thread/{thread_id}.json'
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        data = urllib.request.urlopen(req).read().decode('utf-8')
+        thread_json = json.loads(data)
+        posts = thread_json.get('posts', [])
+        if posts:
+            op = posts[0]
+            # Prefer 'sub' (Subject)
+            if 'sub' in op:
+                return clean_filename(html.unescape(op['sub']))
+            # Fallback to 'com' (Comment)
+            if 'com' in op:
+                comment = op['com']
+                # Strip HTML tags
+                comment = re.sub(r'<[^>]+>', '', comment)
+                comment = html.unescape(comment)
+                # Truncate to a reasonable length (e.g. 50 chars)
+                if len(comment) > 50:
+                    comment = comment[:50].strip() + '...'
+                return clean_filename(comment)
+    except Exception as e:
+        log.debug(f"Failed to fetch subject via API for {board}/{thread_id}: {e}")
+
+    # 2. Fallback to HTML scraping
+    try:
+        thread_url = f'https://boards.4chan.org/{board}/thread/{thread_id}'
+        html_content = load(thread_url).decode('utf-8')
+        # Regex for subject: <span class="subject">Subject Here</span>
+        match = re.search(r'<span class="subject">([^<]+)</span>', html_content)
+        if match:
+            return clean_filename(html.unescape(match.group(1)))
+    except Exception as e:
+        log.debug(f"Failed to fetch subject via HTML for {board}/{thread_id}: {e}")
+
+    return None
+
+
 def get_title_list(html_content):
     """Parse the HTML content and extract the 'title' attribute from file links.
 
@@ -365,17 +446,33 @@ def download_thread(thread_link, args):
         None
     """
     board = thread_link.split('/')[3]
-    thread = thread_link.split('/')[5].split('#')[0]
-    if len(thread_link.split('/')) > 6:
-        thread_tmp = thread_link.split('/')[6].split('#')[0]
+    # thread_id is the numeric ID (e.g. 123456)
+    thread_id = thread_link.split('/')[5].split('#')[0]
 
-        if args.use_names or os.path.exists(os.path.join(workpath, 'downloads', board, thread_tmp)):
-            thread = thread_tmp
+    # Determine the directory name to use
+    thread_dir_name = thread_id
 
-    log.info('Watching ' + board + '/' + thread)
+    # Check for existing slug or --use-names flag
+    has_slug = len(thread_link.split('/')) > 6
+    if has_slug:
+        slug = thread_link.split('/')[6].split('#')[0]
+        # logic for existing slug support
+        if args.use_names or os.path.exists(os.path.join(workpath, 'downloads', board, slug)):
+            thread_dir_name = slug
+
+    # Logic for --subject: override directory name with "ID (Subject)"
+    if args.subject:
+        # Check if we already have a directory matching the ID+Subject pattern to avoid re-fetching
+        # or if we need to fetch it.
+        # Simple approach: fetch it.
+        subject = get_thread_subject(board, thread_id)
+        if subject:
+            thread_dir_name = f"{thread_id} ({subject})"
+
+    log.info(f'Watching {board}/{thread_id} (Dir: {thread_dir_name})')
     throttle = args.throttle
 
-    directory = os.path.join(workpath, 'downloads', board, thread)
+    directory = os.path.join(workpath, 'downloads', board, thread_dir_name)
     if not os.path.exists(directory):
         os.makedirs(directory)
 
@@ -410,16 +507,16 @@ def download_thread(thread_link, args):
     try:
         conn_tmp = sqlite3.connect(DB_PATH, timeout=30)
         cur_tmp = conn_tmp.cursor()
-        cur_tmp.execute('SELECT md5 FROM hashes WHERE thread=?', (thread,))
+        cur_tmp.execute('SELECT md5 FROM hashes WHERE thread=?', (thread_dir_name,))
         rows = cur_tmp.fetchall()
         md5_hashes.update(r[0] for r in rows if r and r[0])
         conn_tmp.close()
         if args.verbose:
-            log.info('Loaded ' + str(len(md5_hashes)) + ' per-thread hashes from DB for ' + board + '/' + thread)
+            log.info('Loaded ' + str(len(md5_hashes)) + ' per-thread hashes from DB for ' + board + '/' + thread_dir_name)
     except Exception:
         md5_hashes = set()
         if args.verbose:
-            log.info('No per-thread hashes in DB for ' + board + '/' + thread + '. Scanning directory for existing files...')
+            log.info('No per-thread hashes in DB for ' + board + '/' + thread_dir_name + '. Scanning directory for existing files...')
 
     # Scan the thread directory and integrate any existing files into the
     # per-thread set and the global DB. Also remove legacy `.hashes.txt`.
@@ -450,7 +547,7 @@ def download_thread(thread_link, args):
                     log.warning('Could not remove duplicate file ' + full_path + ': ' + str(e))
             md5_hashes.add(file_hash)
             # Ensure global DB has this entry
-            insert_md5(file_hash, full_path, thread)
+            insert_md5(file_hash, full_path, thread_dir_name)
 
     # --- End MD5 Hashing Logic ---
 
@@ -462,7 +559,8 @@ def download_thread(thread_link, args):
         try:
             # Prefer the 4chan JSON API to avoid downloading duplicates
             try:
-                api_url = f'https://a.4cdn.org/{board}/thread/{thread}.json'
+                # Use thread_id for API calls to ensure it works even if directory is renamed
+                api_url = f'https://a.4cdn.org/{board}/thread/{thread_id}.json'
                 req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
                 api_data = urllib.request.urlopen(req).read().decode('utf-8')
                 thread_json = json.loads(api_data)
@@ -529,20 +627,7 @@ def download_thread(thread_link, args):
                         imgname = all_titles[enum_index]
 
                     if imgname:
-                        try:
-                            from django.utils.text import get_valid_filename  # prefer Django if available
-                        except Exception:
-                            # Lightweight fallback of Django's get_valid_filename to avoid a hard dependency
-                            def get_valid_filename(s):
-                                s = str(s).strip()
-                                # remove characters that are not word chars, dot, dash or space
-                                s = re.sub(r'(?u)[^-\w.\s]', '', s)
-                                # replace spaces with underscores to produce a safe filename
-                                s = s.replace(' ', '_')
-                                if not s:
-                                    s = 'file'
-                                return s
-                        img_path = os.path.join(directory, get_valid_filename(imgname))
+                        img_path = os.path.join(directory, clean_filename(imgname))
                     else:
                         # Fallback to normal behavior if we couldn't determine a title
                         # (This duplicates logic from the 'else' block below, but effectively
@@ -616,13 +701,13 @@ def download_thread(thread_link, args):
                 if getattr(args, 'verbose', False):
                     display_save = (locals().get('chosen_name') or os.path.basename(img_path))
                     try:
-                        log.debug(f'Downloading {display_save} from {board}/{thread} (url: {link})')
+                        log.debug(f'Downloading {display_save} from {board}/{thread_dir_name} (url: {link})')
                     except Exception:
-                        log.debug('Downloading file from %s/%s', board, thread)
+                        log.debug('Downloading file from %s/%s', board, thread_dir_name)
                 # Skip items where the link is missing to avoid calling startswith on None
                 if not link:
                     if getattr(args, 'verbose', False):
-                        log.warning('Skipping item with missing link at index %s in %s/%s', enum_index, board, thread)
+                        log.warning('Skipping item with missing link at index %s in %s/%s', enum_index, board, thread_dir_name)
                     count += 1
                     continue
                 if link.startswith('//'):
@@ -644,9 +729,9 @@ def download_thread(thread_link, args):
                 # Emit a single, concise INFO line only for newly saved files.
                 filename_only = os.path.basename(img_path) or (img or '')
                 if args.with_counter:
-                    log.info('[%s/%s] NEW: %s/%s', str(count).rjust(len(str(total))), total, board + '/' + thread, filename_only)
+                    log.info('[%s/%s] NEW: %s/%s', str(count).rjust(len(str(total))), total, board + '/' + thread_dir_name, filename_only)
                 else:
-                    log.info('NEW: %s/%s', board + '/' + thread, filename_only)
+                    log.info('NEW: %s/%s', board + '/' + thread_dir_name, filename_only)
 
                 with open(img_path, 'wb') as f:
                     f.write(data)
@@ -654,13 +739,13 @@ def download_thread(thread_link, args):
                 # Now that file is saved to disk, update per-thread md5s and
                 # persist the global mapping into the SQLite DB.
                 md5_hashes.add(data_hash)
-                insert_md5(data_hash, img_path, thread)
+                insert_md5(data_hash, img_path, thread_dir_name)
 
                 # Also copy the file into the `new/` directory layout so that
                 # external tools can easily pick up newly downloaded images.
                 # This is optional and controlled by `--new-dir`.
                 if args.new_dir:
-                    copy_directory = os.path.join(workpath, 'new', board, thread)
+                    copy_directory = os.path.join(workpath, 'new', board, thread_dir_name)
                     if not os.path.exists(copy_directory):
                         os.makedirs(copy_directory)
                     # chosen_name may be unbound when --title is used (img_path is set directly),
@@ -699,7 +784,7 @@ def download_thread(thread_link, args):
         time.sleep(args.refresh_time)
 
         if args.verbose:
-            log.info('Checking ' + board + '/' + thread)
+            log.info('Checking ' + board + '/' + thread_dir_name)
 
 def download_from_file(filename):
     """Manage multiple watcher processes for each thread listed in a file.
