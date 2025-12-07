@@ -23,6 +23,7 @@ import fileinput
 import hashlib
 import json
 import base64
+import html
 from multiprocessing import Process
 
 log = logging.getLogger('inb4404')
@@ -39,6 +40,9 @@ def init_db():
 
     This function is idempotent and safe to call multiple times. It sets
     `journal_mode=WAL` to improve concurrency between processes.
+
+    Returns:
+        None
     """
     conn = None
     try:
@@ -57,7 +61,14 @@ def init_db():
                 pass
 
 def get_md5_path(md5):
-    """Return stored path for `md5` or None when not present."""
+    """Return stored path for `md5` or None when not present.
+
+    Args:
+        md5 (str): The MD5 hash to look up.
+
+    Returns:
+        str or None: The file path associated with the MD5 hash, or None if not found.
+    """
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         cur = conn.cursor()
@@ -67,11 +78,31 @@ def get_md5_path(md5):
         return row[0] if row else None
     except Exception:
         return None
+
+
 def has_md5(md5):
+    """Check if the given MD5 hash exists in the database.
+
+    Args:
+        md5 (str): The MD5 hash to check.
+
+    Returns:
+        bool: True if the hash exists, False otherwise.
+    """
     return get_md5_path(md5) is not None
 
+
 def insert_md5(md5, path, thread_name):
-    """Insert md5->path mapping. Uses INSERT OR IGNORE to avoid races."""
+    """Insert md5->path mapping. Uses INSERT OR IGNORE to avoid races.
+
+    Args:
+        md5 (str): The MD5 hash of the file.
+        path (str): The file path.
+        thread_name (str): The name/ID of the thread.
+
+    Returns:
+        None
+    """
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         with conn:
@@ -80,9 +111,20 @@ def insert_md5(md5, path, thread_name):
     except Exception as e:
         log.warning('Could not write to hashes DB: ' + str(e))
 
+
 def upsert_md5(md5, path, thread_name):
-    """Insert or replace the md5->path mapping. Used after dedupe to ensure
-    the DB points to the kept file path."""
+    """Insert or replace the md5->path mapping.
+
+    Used after dedupe to ensure the DB points to the kept file path.
+
+    Args:
+        md5 (str): The MD5 hash of the file.
+        path (str): The file path.
+        thread_name (str): The name/ID of the thread.
+
+    Returns:
+        None
+    """
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         with conn:
@@ -92,14 +134,21 @@ def upsert_md5(md5, path, thread_name):
         log.warning('Could not upsert into hashes DB: ' + str(e))
 
 def main():
+    """Entry point for the script.
+
+    Parses command-line arguments and either starts a watcher for a single
+    thread URL or treats the provided argument as a filename containing a
+    list of thread URLs (one per line).
+
+    The argument parsing below wires several feature flags and timings that
+    control behavior such as throttling between downloads, whether to
+    preserve original file names, whether to create a separate 'new'
+    directory for recent downloads, and whether to reload the queue file.
+
+    Returns:
+        None
+    """
     global args
-    # Entry point for the script. Parses command-line arguments and either
-    # starts a watcher for a single thread URL or treats the provided argument
-    # as a filename containing a list of thread URLs (one per line).
-    #
-    # The argument parsing below wires several feature flags and timings that
-    # control behavior such as throttling between downloads, whether to
-    # preserve original file names, and whether to reload the queue file.
     parser = argparse.ArgumentParser(description='inb4404')
 
     parser.add_argument('thread', nargs='?', help='url of the thread (or filename; one url per line)')
@@ -110,7 +159,8 @@ def main():
     parser.add_argument('-n', '--use-names', action='store_true', help='use thread names instead of the thread ids (...4chan.org/board/thread/thread-id/thread-name)')
     parser.add_argument('-r', '--reload', action='store_true', help='reload the queue file every 5 minutes')
     parser.add_argument('-t', '--title', action='store_true', help='save original filenames')
-    parser.add_argument(      '--no-new-dir', action='store_true', help='don\'t create the `new` directory')
+    parser.add_argument(      '--subject', action='store_true', help='use thread subject in directory name')
+    parser.add_argument(      '--new-dir', action='store_true', help='create the `new` directory')
     parser.add_argument(      '--refresh-time', type=float, default=20, help='Delay in seconds before refreshing the thread')
     parser.add_argument(      '--reload-time', type=float, default=5, help='Delay in minutes before reloading the file. Default: 5')
     parser.add_argument(      '--throttle', type=float, default=0.5, help='Delay in seconds between downloads in the same thread')
@@ -158,11 +208,19 @@ def main():
         download_from_file(thread)
 
 def load(url):
-    # Perform an HTTP GET and return the raw bytes of the response.
-    # A Request object is used with common headers (User-Agent, Referer,
-    # Accept-Language etc.) to mimic a modern browser and avoid basic
-    # anti-bot measures. The referer is derived from the URL's board root so
-    # that some hosts accept the request.
+    """Perform an HTTP GET and return the raw bytes of the response.
+
+    A Request object is used with common headers (User-Agent, Referer,
+    Accept-Language etc.) to mimic a modern browser and avoid basic
+    anti-bot measures. The referer is derived from the URL's board root so
+    that some hosts accept the request.
+
+    Args:
+        url (str): The URL to fetch.
+
+    Returns:
+        bytes: The raw content of the response.
+    """
     parsed = urllib.parse.urlparse(url)
     path_parts = parsed.path.strip('/').split('/')
     referer = f'{parsed.scheme}://{parsed.netloc}/{path_parts[0]}'
@@ -182,12 +240,99 @@ def load(url):
     })
     return urllib.request.urlopen(req).read()
 
+def clean_filename(s):
+    """Sanitize a string to be safe for use as a filename.
+
+    Removes non-word characters (except for dots, dashes, and spaces) and
+    replaces spaces with underscores if Django is not available.
+
+    Args:
+        s (str): The string to sanitize.
+
+    Returns:
+        str: The sanitized filename.
+    """
+    try:
+        from django.utils.text import get_valid_filename  # prefer Django if available
+        return get_valid_filename(s)
+    except ImportError:
+        s = str(s).strip()
+        # remove characters that are not word chars, dot, dash or space
+        s = re.sub(r'(?u)[^-\w.\s]', '', s)
+        # replace spaces with underscores to produce a safe filename
+        s = s.replace(' ', '_')
+        if not s:
+            s = 'file'
+        return s
+
+
+def get_thread_subject(board, thread_id):
+    """Retrieve the subject of a thread (or a comment snippet).
+
+    Attempts to fetch the thread via the 4chan JSON API first. If successful,
+    returns the 'sub' (subject) field if present, or a snippet of the 'com'
+    (comment) field. If the API fails, attempts to scrape the subject from
+    the HTML.
+
+    Args:
+        board (str): The board identifier (e.g., 'g', 'wg').
+        thread_id (str): The numeric thread ID.
+
+    Returns:
+        str or None: The sanitized subject/snippet, or None if retrieval failed.
+    """
+    # 1. Try JSON API
+    try:
+        api_url = f'https://a.4cdn.org/{board}/thread/{thread_id}.json'
+        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+        data = urllib.request.urlopen(req).read().decode('utf-8')
+        thread_json = json.loads(data)
+        posts = thread_json.get('posts', [])
+        if posts:
+            op = posts[0]
+            # Prefer 'sub' (Subject)
+            if 'sub' in op:
+                return clean_filename(html.unescape(op['sub']))
+            # Fallback to 'com' (Comment)
+            if 'com' in op:
+                comment = op['com']
+                # Strip HTML tags
+                comment = re.sub(r'<[^>]+>', '', comment)
+                comment = html.unescape(comment)
+                # Truncate to a reasonable length (e.g. 50 chars)
+                if len(comment) > 50:
+                    comment = comment[:50].strip() + '...'
+                return clean_filename(comment)
+    except Exception as e:
+        log.debug(f"Failed to fetch subject via API for {board}/{thread_id}: {e}")
+
+    # 2. Fallback to HTML scraping
+    try:
+        thread_url = f'https://boards.4chan.org/{board}/thread/{thread_id}'
+        html_content = load(thread_url).decode('utf-8')
+        # Regex for subject: <span class="subject">Subject Here</span>
+        match = re.search(r'<span class="subject">([^<]+)</span>', html_content)
+        if match:
+            return clean_filename(html.unescape(match.group(1)))
+    except Exception as e:
+        log.debug(f"Failed to fetch subject via HTML for {board}/{thread_id}: {e}")
+
+    return None
+
+
 def get_title_list(html_content):
-    # Parse the HTML content and extract the 'title' attribute from the
-    # per-file link elements. This is used when the `--title` flag is set to
-    # preserve the filename/title supplied in the post rather than the server
-    # numeric name. Falls back to link text when the title attribute is
-    # missing.
+    """Parse the HTML content and extract the 'title' attribute from file links.
+
+    This is used when the `--title` flag is set to preserve the filename/title
+    supplied in the post rather than the server numeric name. Falls back to
+    link text when the title attribute is missing.
+
+    Args:
+        html_content (str or bytes): The HTML content of the thread.
+
+    Returns:
+        list of str: A list of titles/filenames extracted from the HTML.
+    """
     ret = list()
 
     from bs4 import BeautifulSoup, element as bs4_element
@@ -228,8 +373,14 @@ def get_title_list(html_content):
     return ret
 
 def get_md5(file_path):
-    # Compute and return the MD5 hex digest of a file's contents.
-    # Returns None if the file cannot be read.
+    """Compute and return the MD5 hex digest of a file's contents.
+
+    Args:
+        file_path (str): The path to the file.
+
+    Returns:
+        str or None: The MD5 hex digest, or None if the file cannot be read.
+    """
     hash_md5 = hashlib.md5()
     try:
         with open(file_path, "rb") as f:
@@ -241,15 +392,24 @@ def get_md5(file_path):
     return hash_md5.hexdigest()
 
 def call_download_thread(thread_link, args):
-    # Helper wrapper used when spawning a multiprocessing.Process. The
-    # Process target should be a picklable callable; this thin wrapper lets
-    # the child process run `download_thread` and simply ignores
-    # KeyboardInterrupt so cleanup can proceed gracefully in the parent.
-    # Ensure logging is configured in spawned child processes so that
-    # per-file download messages are emitted to the console when the
-    # script is run in "file of links" mode (multiprocessing spawn
-    # on Windows doesn't inherit the parent's basicConfig). Use the
-    # same date format selection as the main process.
+    """Helper wrapper used when spawning a multiprocessing.Process.
+
+    The Process target should be a picklable callable; this thin wrapper lets
+    the child process run `download_thread` and simply ignores
+    KeyboardInterrupt so cleanup can proceed gracefully in the parent.
+    Ensure logging is configured in spawned child processes so that
+    per-file download messages are emitted to the console when the
+    script is run in "file of links" mode (multiprocessing spawn
+    on Windows doesn't inherit the parent's basicConfig). Use the
+    same date format selection as the main process.
+
+    Args:
+        thread_link (str): The URL of the thread to download.
+        args (argparse.Namespace): The parsed command-line arguments.
+
+    Returns:
+        None
+    """
     try:
         if getattr(args, 'date', False):
             logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %I:%M:%S %p')
@@ -267,29 +427,53 @@ def call_download_thread(thread_link, args):
         pass
 
 def download_thread(thread_link, args):
-    # Primary watcher function. This runs in either the current process (if
-    # invoked directly) or in a spawned child process when `download_from_file`
-    # starts multiple watchers.
-    #
-    # Responsibilities:
-    # - Determine board and thread identifiers from the provided URL
-    # - Create/ensure download directories exist for the thread
-    # - Load per-thread and global MD5 hash lists to avoid duplicates
-    # - Poll the thread (via JSON API when possible) for new files
-    # - Download new files, write them to disk, and update the hash DBs
+    """Primary watcher function to monitor a thread and download files.
 
+    This runs in either the current process (if invoked directly) or in a
+    spawned child process when `download_from_file` starts multiple watchers.
+
+    Responsibilities:
+    - Determine board and thread identifiers from the provided URL
+    - Create/ensure download directories exist for the thread
+    - Load per-thread and global MD5 hash lists to avoid duplicates
+    - Poll the thread (via JSON API when possible) for new files
+    - Download new files, write them to disk, and update the hash DBs
+
+    Args:
+        thread_link (str): The URL of the thread.
+        args (argparse.Namespace): The parsed command-line arguments.
+
+    Returns:
+        None
+    """
     board = thread_link.split('/')[3]
-    thread = thread_link.split('/')[5].split('#')[0]
-    if len(thread_link.split('/')) > 6:
-        thread_tmp = thread_link.split('/')[6].split('#')[0]
+    # thread_id is the numeric ID (e.g. 123456)
+    thread_id = thread_link.split('/')[5].split('#')[0]
 
-        if args.use_names or os.path.exists(os.path.join(workpath, 'downloads', board, thread_tmp)):
-            thread = thread_tmp
+    # Determine the directory name to use
+    thread_dir_name = thread_id
 
-    log.info('Watching ' + board + '/' + thread)
+    # Check for existing slug or --use-names flag
+    has_slug = len(thread_link.split('/')) > 6
+    if has_slug:
+        slug = thread_link.split('/')[6].split('#')[0]
+        # logic for existing slug support
+        if args.use_names or os.path.exists(os.path.join(workpath, 'downloads', board, slug)):
+            thread_dir_name = slug
+
+    # Logic for --subject: override directory name with "ID (Subject)"
+    if args.subject:
+        # Check if we already have a directory matching the ID+Subject pattern to avoid re-fetching
+        # or if we need to fetch it.
+        # Simple approach: fetch it.
+        subject = get_thread_subject(board, thread_id)
+        if subject:
+            thread_dir_name = f"{thread_id} ({subject})"
+
+    log.info(f'Watching {board}/{thread_id} (Dir: {thread_dir_name})')
     throttle = args.throttle
 
-    directory = os.path.join(workpath, 'downloads', board, thread)
+    directory = os.path.join(workpath, 'downloads', board, thread_dir_name)
     if not os.path.exists(directory):
         os.makedirs(directory)
 
@@ -324,16 +508,16 @@ def download_thread(thread_link, args):
     try:
         conn_tmp = sqlite3.connect(DB_PATH, timeout=30)
         cur_tmp = conn_tmp.cursor()
-        cur_tmp.execute('SELECT md5 FROM hashes WHERE thread=?', (thread,))
+        cur_tmp.execute('SELECT md5 FROM hashes WHERE thread=?', (thread_dir_name,))
         rows = cur_tmp.fetchall()
         md5_hashes.update(r[0] for r in rows if r and r[0])
         conn_tmp.close()
         if args.verbose:
-            log.info('Loaded ' + str(len(md5_hashes)) + ' per-thread hashes from DB for ' + board + '/' + thread)
+            log.info('Loaded ' + str(len(md5_hashes)) + ' per-thread hashes from DB for ' + board + '/' + thread_dir_name)
     except Exception:
         md5_hashes = set()
         if args.verbose:
-            log.info('No per-thread hashes in DB for ' + board + '/' + thread + '. Scanning directory for existing files...')
+            log.info('No per-thread hashes in DB for ' + board + '/' + thread_dir_name + '. Scanning directory for existing files...')
 
     # Scan the thread directory and integrate any existing files into the
     # per-thread set and the global DB. Also remove legacy `.hashes.txt`.
@@ -364,7 +548,7 @@ def download_thread(thread_link, args):
                     log.warning('Could not remove duplicate file ' + full_path + ': ' + str(e))
             md5_hashes.add(file_hash)
             # Ensure global DB has this entry
-            insert_md5(file_hash, full_path, thread)
+            insert_md5(file_hash, full_path, thread_dir_name)
 
     # --- End MD5 Hashing Logic ---
 
@@ -376,7 +560,8 @@ def download_thread(thread_link, args):
         try:
             # Prefer the 4chan JSON API to avoid downloading duplicates
             try:
-                api_url = f'https://a.4cdn.org/{board}/thread/{thread}.json'
+                # Use thread_id for API calls to ensure it works even if directory is renamed
+                api_url = f'https://a.4cdn.org/{board}/thread/{thread_id}.json'
                 req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
                 api_data = urllib.request.urlopen(req).read().decode('utf-8')
                 thread_json = json.loads(api_data)
@@ -427,23 +612,32 @@ def download_thread(thread_link, args):
                 if len(enum_tuple) >= 7:
                     ext = enum_tuple[6]
 
-                if args.title and 'all_titles' in locals() and len(all_titles) > enum_index:
-                    imgname = all_titles[enum_index]
-                    try:
-                        from django.utils.text import get_valid_filename  # prefer Django if available
-                    except Exception:
-                        # Lightweight fallback of Django's get_valid_filename to avoid a hard dependency
-                        def get_valid_filename(s):
-                            s = str(s).strip()
-                            # remove characters that are not word chars, dot, dash or space
-                            s = re.sub(r'(?u)[^-\w.\s]', '', s)
-                            # replace spaces with underscores to produce a safe filename
-                            s = s.replace(' ', '_')
-                            if not s:
-                                s = 'file'
-                            return s
-                    img_path = os.path.join(directory, get_valid_filename(imgname))
-                else:
+                # Logic for naming the file when --title is used
+                # Priority:
+                # 1. Use original filename from API (if available)
+                # 2. Use title extracted from HTML (if available)
+                # 3. Fallback to default naming (else block)
+                if args.title:
+                    imgname = None
+                    # Use original_name from API if available. Note: API 'filename' usually lacks extension.
+                    if original_name:
+                        file_ext = ext if ext else os.path.splitext(img or '')[1]
+                        imgname = original_name + (file_ext or '')
+                    # Fallback to HTML-extracted title
+                    elif 'all_titles' in locals() and len(all_titles) > enum_index:
+                        imgname = all_titles[enum_index]
+
+                    if imgname:
+                        img_path = os.path.join(directory, clean_filename(imgname))
+                    else:
+                        # Fallback to normal behavior if we couldn't determine a title
+                        # (This duplicates logic from the 'else' block below, but effectively
+                        # if imgname is None we just fall through to the else logic?
+                        # No, python doesn't support fallthrough. We need to handle the 'else' logic carefully.)
+                        pass
+
+                # If args.title was False, OR if it was True but we couldn't find a name (imgname is None)
+                if not args.title or (args.title and not locals().get('imgname')):
                     # Allow user to choose original server filename (when available)
                     chosen_name = img
                     if args.origin_name:
@@ -508,13 +702,13 @@ def download_thread(thread_link, args):
                 if getattr(args, 'verbose', False):
                     display_save = (locals().get('chosen_name') or os.path.basename(img_path))
                     try:
-                        log.debug(f'Downloading {display_save} from {board}/{thread} (url: {link})')
+                        log.debug(f'Downloading {display_save} from {board}/{thread_dir_name} (url: {link})')
                     except Exception:
-                        log.debug('Downloading file from %s/%s', board, thread)
+                        log.debug('Downloading file from %s/%s', board, thread_dir_name)
                 # Skip items where the link is missing to avoid calling startswith on None
                 if not link:
                     if getattr(args, 'verbose', False):
-                        log.warning('Skipping item with missing link at index %s in %s/%s', enum_index, board, thread)
+                        log.warning('Skipping item with missing link at index %s in %s/%s', enum_index, board, thread_dir_name)
                     count += 1
                     continue
                 if link.startswith('//'):
@@ -536,9 +730,9 @@ def download_thread(thread_link, args):
                 # Emit a single, concise INFO line only for newly saved files.
                 filename_only = os.path.basename(img_path) or (img or '')
                 if args.with_counter:
-                    log.info('[%s/%s] NEW: %s/%s', str(count).rjust(len(str(total))), total, board + '/' + thread, filename_only)
+                    log.info('[%s/%s] NEW: %s/%s', str(count).rjust(len(str(total))), total, board + '/' + thread_dir_name, filename_only)
                 else:
-                    log.info('NEW: %s/%s', board + '/' + thread, filename_only)
+                    log.info('NEW: %s/%s', board + '/' + thread_dir_name, filename_only)
 
                 with open(img_path, 'wb') as f:
                     f.write(data)
@@ -546,13 +740,13 @@ def download_thread(thread_link, args):
                 # Now that file is saved to disk, update per-thread md5s and
                 # persist the global mapping into the SQLite DB.
                 md5_hashes.add(data_hash)
-                insert_md5(data_hash, img_path, thread)
+                insert_md5(data_hash, img_path, thread_dir_name)
 
                 # Also copy the file into the `new/` directory layout so that
                 # external tools can easily pick up newly downloaded images.
-                # This is optional and controlled by `--no-new-dir`.
-                if not args.no_new_dir:
-                    copy_directory = os.path.join(workpath, 'new', board, thread)
+                # This is optional and controlled by `--new-dir`.
+                if args.new_dir:
+                    copy_directory = os.path.join(workpath, 'new', board, thread_dir_name)
                     if not os.path.exists(copy_directory):
                         os.makedirs(copy_directory)
                     # chosen_name may be unbound when --title is used (img_path is set directly),
@@ -581,7 +775,17 @@ def download_thread(thread_link, args):
                 time.sleep(10) # wait before trying again
                 load(thread_link)
             except urllib.error.HTTPError as ex2:
-                log.info('%s %s\'d', thread_link, str(ex2.code))
+                code = getattr(ex2, 'code', None)
+                log.info('%s %s\'d', thread_link, str(code))
+                # If the thread truly returned 404, exit the watcher process
+                # with a distinct exit code so the parent monitor can detect
+                # the condition and immediately disable the link instead of
+                # probing/restarting it.
+                if code == 404:
+                    import sys
+                    # Use SystemExit with code 404 so multiprocessing sets
+                    # the child process exitcode to 404.
+                    raise SystemExit(404)
                 break
             continue
         except (urllib.error.URLError, http.client.BadStatusLine, http.client.IncompleteRead):
@@ -591,15 +795,23 @@ def download_thread(thread_link, args):
         time.sleep(args.refresh_time)
 
         if args.verbose:
-            log.info('Checking ' + board + '/' + thread)
+            log.info('Checking ' + board + '/' + thread_dir_name)
 
 def download_from_file(filename):
-    # Manage multiple watcher processes for each thread listed in a file.
-    # Each non-comment, non-disabled line that begins with 'http' is treated
-    # as a thread URL to be watched in its own Process. A small Lock is
-    # created for coordination (reserved for future use) and a map of
-    # running processes is kept so we can detect dead processes and restart
-    # or disable them in the queue file.
+    """Manage multiple watcher processes for each thread listed in a file.
+
+    Each non-comment, non-disabled line that begins with 'http' is treated
+    as a thread URL to be watched in its own Process. A small Lock is
+    created for coordination (reserved for future use) and a map of
+    running processes is kept so we can detect dead processes and restart
+    or disable them in the queue file.
+
+    Args:
+        filename (str): The path to the file containing thread URLs.
+
+    Returns:
+        None
+    """
     from multiprocessing import Process, Lock
     running_processes = {}  # {link: process}
     lock = Lock()
@@ -644,6 +856,37 @@ def download_from_file(filename):
             max_restarts = 3
             for link in dead_links:
                 log.info('Watcher for ' + link + ' appears to have stopped; probing and attempting restart.')
+
+                # If the child process exited with code 404, we know the
+                # thread was deleted; immediately disable the link in the
+                # file without probing or attempting restarts.
+                proc = running_processes.get(link)
+                try:
+                    exitcode = getattr(proc, 'exitcode', None)
+                except Exception:
+                    exitcode = None
+
+                if exitcode == 404:
+                    try:
+                        with open(filename, 'r', encoding='utf-8') as f:
+                            lines = f.readlines()
+                        new_lines = []
+                        disabled = False
+                        for line in lines:
+                            stripped = line.strip()
+                            if stripped == link and not line.startswith('-'):
+                                new_lines.append('-' + line)
+                                disabled = True
+                                log.info('Disabled ' + stripped + ' in ' + filename + ' (404)')
+                            else:
+                                new_lines.append(line)
+                        if disabled:
+                            with open(filename, 'w', encoding='utf-8') as f:
+                                f.writelines(new_lines)
+                    except IOError as e:
+                        log.error('Error writing to file ' + filename + ': ' + str(e))
+                    running_processes.pop(link, None)
+                    continue
 
                 # Quick probe: try to load the thread page to detect 404s
                 is_404 = False
@@ -766,9 +1009,14 @@ def download_from_file(filename):
 
 
 def dedupe_downloads():
-    """Scan `downloads/`, compute MD5s for all files, keep the oldest file
-    for each identical content hash and delete the rest. Update the
-    SQLite DB and rebuild per-thread `.hashes.txt` files.
+    """Scan `downloads/` directory and remove duplicate files.
+
+    Computes MD5s for all files, keeps the oldest file for each identical
+    content hash, and deletes the rest. Updates the SQLite DB and removes
+    legacy per-thread `.hashes.txt` files.
+
+    Returns:
+        None
     """
     downloads_root = os.path.join(workpath, 'downloads')
     if not os.path.exists(downloads_root):
