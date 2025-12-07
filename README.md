@@ -92,7 +92,7 @@ Here are some of the most common options:
 | `-r`, `--reload`       | Reload the queue file every 5 minutes for new or removed threads.                        |
 | `-t`, `--title`        | Save files using the post's title as the filename (requires optional libraries).         |
 | `--new-dir`              | Create a separate `new` directory for recent downloads (default: off).                   |
-| `--subject`              | Include the thread subject (or comment snippet) in the download directory name.          |
+| `--no-subject`           | Do not include the thread subject in the download directory name.                        |
 | `--origin-name`          | Save files using the original filename given on the board.                               |
 | `--refresh-time SEC`     | Time in seconds to wait before refreshing a thread (default: 20).                        |
 | `--reload-time MIN`      | Delay in minutes before reloading the file (default: 5).                                 |
