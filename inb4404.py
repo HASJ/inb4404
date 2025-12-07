@@ -39,6 +39,9 @@ def init_db():
 
     This function is idempotent and safe to call multiple times. It sets
     `journal_mode=WAL` to improve concurrency between processes.
+
+    Returns:
+        None
     """
     conn = None
     try:
@@ -57,7 +60,14 @@ def init_db():
                 pass
 
 def get_md5_path(md5):
-    """Return stored path for `md5` or None when not present."""
+    """Return stored path for `md5` or None when not present.
+
+    Args:
+        md5 (str): The MD5 hash to look up.
+
+    Returns:
+        str or None: The file path associated with the MD5 hash, or None if not found.
+    """
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         cur = conn.cursor()
@@ -67,11 +77,31 @@ def get_md5_path(md5):
         return row[0] if row else None
     except Exception:
         return None
+
+
 def has_md5(md5):
+    """Check if the given MD5 hash exists in the database.
+
+    Args:
+        md5 (str): The MD5 hash to check.
+
+    Returns:
+        bool: True if the hash exists, False otherwise.
+    """
     return get_md5_path(md5) is not None
 
+
 def insert_md5(md5, path, thread_name):
-    """Insert md5->path mapping. Uses INSERT OR IGNORE to avoid races."""
+    """Insert md5->path mapping. Uses INSERT OR IGNORE to avoid races.
+
+    Args:
+        md5 (str): The MD5 hash of the file.
+        path (str): The file path.
+        thread_name (str): The name/ID of the thread.
+
+    Returns:
+        None
+    """
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         with conn:
@@ -80,9 +110,20 @@ def insert_md5(md5, path, thread_name):
     except Exception as e:
         log.warning('Could not write to hashes DB: ' + str(e))
 
+
 def upsert_md5(md5, path, thread_name):
-    """Insert or replace the md5->path mapping. Used after dedupe to ensure
-    the DB points to the kept file path."""
+    """Insert or replace the md5->path mapping.
+
+    Used after dedupe to ensure the DB points to the kept file path.
+
+    Args:
+        md5 (str): The MD5 hash of the file.
+        path (str): The file path.
+        thread_name (str): The name/ID of the thread.
+
+    Returns:
+        None
+    """
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30)
         with conn:
@@ -92,14 +133,20 @@ def upsert_md5(md5, path, thread_name):
         log.warning('Could not upsert into hashes DB: ' + str(e))
 
 def main():
+    """Entry point for the script.
+
+    Parses command-line arguments and either starts a watcher for a single
+    thread URL or treats the provided argument as a filename containing a
+    list of thread URLs (one per line).
+
+    The argument parsing below wires several feature flags and timings that
+    control behavior such as throttling between downloads, whether to
+    preserve original file names, and whether to reload the queue file.
+
+    Returns:
+        None
+    """
     global args
-    # Entry point for the script. Parses command-line arguments and either
-    # starts a watcher for a single thread URL or treats the provided argument
-    # as a filename containing a list of thread URLs (one per line).
-    #
-    # The argument parsing below wires several feature flags and timings that
-    # control behavior such as throttling between downloads, whether to
-    # preserve original file names, and whether to reload the queue file.
     parser = argparse.ArgumentParser(description='inb4404')
 
     parser.add_argument('thread', nargs='?', help='url of the thread (or filename; one url per line)')
@@ -158,11 +205,19 @@ def main():
         download_from_file(thread)
 
 def load(url):
-    # Perform an HTTP GET and return the raw bytes of the response.
-    # A Request object is used with common headers (User-Agent, Referer,
-    # Accept-Language etc.) to mimic a modern browser and avoid basic
-    # anti-bot measures. The referer is derived from the URL's board root so
-    # that some hosts accept the request.
+    """Perform an HTTP GET and return the raw bytes of the response.
+
+    A Request object is used with common headers (User-Agent, Referer,
+    Accept-Language etc.) to mimic a modern browser and avoid basic
+    anti-bot measures. The referer is derived from the URL's board root so
+    that some hosts accept the request.
+
+    Args:
+        url (str): The URL to fetch.
+
+    Returns:
+        bytes: The raw content of the response.
+    """
     parsed = urllib.parse.urlparse(url)
     path_parts = parsed.path.strip('/').split('/')
     referer = f'{parsed.scheme}://{parsed.netloc}/{path_parts[0]}'
@@ -183,11 +238,18 @@ def load(url):
     return urllib.request.urlopen(req).read()
 
 def get_title_list(html_content):
-    # Parse the HTML content and extract the 'title' attribute from the
-    # per-file link elements. This is used when the `--title` flag is set to
-    # preserve the filename/title supplied in the post rather than the server
-    # numeric name. Falls back to link text when the title attribute is
-    # missing.
+    """Parse the HTML content and extract the 'title' attribute from file links.
+
+    This is used when the `--title` flag is set to preserve the filename/title
+    supplied in the post rather than the server numeric name. Falls back to
+    link text when the title attribute is missing.
+
+    Args:
+        html_content (str or bytes): The HTML content of the thread.
+
+    Returns:
+        list of str: A list of titles/filenames extracted from the HTML.
+    """
     ret = list()
 
     from bs4 import BeautifulSoup, element as bs4_element
@@ -228,8 +290,14 @@ def get_title_list(html_content):
     return ret
 
 def get_md5(file_path):
-    # Compute and return the MD5 hex digest of a file's contents.
-    # Returns None if the file cannot be read.
+    """Compute and return the MD5 hex digest of a file's contents.
+
+    Args:
+        file_path (str): The path to the file.
+
+    Returns:
+        str or None: The MD5 hex digest, or None if the file cannot be read.
+    """
     hash_md5 = hashlib.md5()
     try:
         with open(file_path, "rb") as f:
@@ -241,15 +309,24 @@ def get_md5(file_path):
     return hash_md5.hexdigest()
 
 def call_download_thread(thread_link, args):
-    # Helper wrapper used when spawning a multiprocessing.Process. The
-    # Process target should be a picklable callable; this thin wrapper lets
-    # the child process run `download_thread` and simply ignores
-    # KeyboardInterrupt so cleanup can proceed gracefully in the parent.
-    # Ensure logging is configured in spawned child processes so that
-    # per-file download messages are emitted to the console when the
-    # script is run in "file of links" mode (multiprocessing spawn
-    # on Windows doesn't inherit the parent's basicConfig). Use the
-    # same date format selection as the main process.
+    """Helper wrapper used when spawning a multiprocessing.Process.
+
+    The Process target should be a picklable callable; this thin wrapper lets
+    the child process run `download_thread` and simply ignores
+    KeyboardInterrupt so cleanup can proceed gracefully in the parent.
+    Ensure logging is configured in spawned child processes so that
+    per-file download messages are emitted to the console when the
+    script is run in "file of links" mode (multiprocessing spawn
+    on Windows doesn't inherit the parent's basicConfig). Use the
+    same date format selection as the main process.
+
+    Args:
+        thread_link (str): The URL of the thread to download.
+        args (argparse.Namespace): The parsed command-line arguments.
+
+    Returns:
+        None
+    """
     try:
         if getattr(args, 'date', False):
             logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %I:%M:%S %p')
@@ -267,17 +344,25 @@ def call_download_thread(thread_link, args):
         pass
 
 def download_thread(thread_link, args):
-    # Primary watcher function. This runs in either the current process (if
-    # invoked directly) or in a spawned child process when `download_from_file`
-    # starts multiple watchers.
-    #
-    # Responsibilities:
-    # - Determine board and thread identifiers from the provided URL
-    # - Create/ensure download directories exist for the thread
-    # - Load per-thread and global MD5 hash lists to avoid duplicates
-    # - Poll the thread (via JSON API when possible) for new files
-    # - Download new files, write them to disk, and update the hash DBs
+    """Primary watcher function to monitor a thread and download files.
 
+    This runs in either the current process (if invoked directly) or in a
+    spawned child process when `download_from_file` starts multiple watchers.
+
+    Responsibilities:
+    - Determine board and thread identifiers from the provided URL
+    - Create/ensure download directories exist for the thread
+    - Load per-thread and global MD5 hash lists to avoid duplicates
+    - Poll the thread (via JSON API when possible) for new files
+    - Download new files, write them to disk, and update the hash DBs
+
+    Args:
+        thread_link (str): The URL of the thread.
+        args (argparse.Namespace): The parsed command-line arguments.
+
+    Returns:
+        None
+    """
     board = thread_link.split('/')[3]
     thread = thread_link.split('/')[5].split('#')[0]
     if len(thread_link.split('/')) > 6:
@@ -594,12 +679,20 @@ def download_thread(thread_link, args):
             log.info('Checking ' + board + '/' + thread)
 
 def download_from_file(filename):
-    # Manage multiple watcher processes for each thread listed in a file.
-    # Each non-comment, non-disabled line that begins with 'http' is treated
-    # as a thread URL to be watched in its own Process. A small Lock is
-    # created for coordination (reserved for future use) and a map of
-    # running processes is kept so we can detect dead processes and restart
-    # or disable them in the queue file.
+    """Manage multiple watcher processes for each thread listed in a file.
+
+    Each non-comment, non-disabled line that begins with 'http' is treated
+    as a thread URL to be watched in its own Process. A small Lock is
+    created for coordination (reserved for future use) and a map of
+    running processes is kept so we can detect dead processes and restart
+    or disable them in the queue file.
+
+    Args:
+        filename (str): The path to the file containing thread URLs.
+
+    Returns:
+        None
+    """
     from multiprocessing import Process, Lock
     running_processes = {}  # {link: process}
     lock = Lock()
@@ -766,9 +859,14 @@ def download_from_file(filename):
 
 
 def dedupe_downloads():
-    """Scan `downloads/`, compute MD5s for all files, keep the oldest file
-    for each identical content hash and delete the rest. Update the
-    SQLite DB and rebuild per-thread `.hashes.txt` files.
+    """Scan `downloads/` directory and remove duplicate files.
+
+    Computes MD5s for all files, keeps the oldest file for each identical
+    content hash, and deletes the rest. Updates the SQLite DB and removes
+    legacy per-thread `.hashes.txt` files.
+
+    Returns:
+        None
     """
     downloads_root = os.path.join(workpath, 'downloads')
     if not os.path.exists(downloads_root):
