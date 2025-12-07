@@ -505,10 +505,11 @@ def download_thread(thread_link, args):
             log.info('No global hash DB found. It will be created as files are downloaded.')
 
     # Load per-thread hashes from DB if present
+    # Use thread_id (not thread_dir_name) for backward compatibility when directory names change
     try:
         conn_tmp = sqlite3.connect(DB_PATH, timeout=30)
         cur_tmp = conn_tmp.cursor()
-        cur_tmp.execute('SELECT md5 FROM hashes WHERE thread=?', (thread_dir_name,))
+        cur_tmp.execute('SELECT md5 FROM hashes WHERE thread=?', (thread_id,))
         rows = cur_tmp.fetchall()
         md5_hashes.update(r[0] for r in rows if r and r[0])
         conn_tmp.close()
@@ -537,8 +538,9 @@ def download_thread(thread_link, args):
             if not file_hash:
                 continue
             # If this hash already exists globally and points to a different file, remove the duplicate
+            # Only remove if the stored path actually exists (to avoid deleting moved files)
             gpath = get_md5_path(file_hash)
-            if gpath and os.path.abspath(gpath) != os.path.abspath(full_path):
+            if gpath and os.path.abspath(gpath) != os.path.abspath(full_path) and os.path.exists(gpath):
                 try:
                     os.remove(full_path)
                     if args.verbose:
@@ -546,9 +548,14 @@ def download_thread(thread_link, args):
                     continue
                 except OSError as e:
                     log.warning('Could not remove duplicate file ' + full_path + ': ' + str(e))
+            # If the stored path doesn't exist (file was moved/deleted), update the DB with the new path
+            elif gpath and not os.path.exists(gpath):
+                # Update the database to point to the current location
+                upsert_md5(file_hash, full_path, thread_id)
             md5_hashes.add(file_hash)
             # Ensure global DB has this entry
-            insert_md5(file_hash, full_path, thread_dir_name)
+            # Use thread_id (not thread_dir_name) for backward compatibility when directory names change
+            insert_md5(file_hash, full_path, thread_id)
 
     # --- End MD5 Hashing Logic ---
 
@@ -739,8 +746,9 @@ def download_thread(thread_link, args):
 
                 # Now that file is saved to disk, update per-thread md5s and
                 # persist the global mapping into the SQLite DB.
+                # Use thread_id (not thread_dir_name) for backward compatibility when directory names change
                 md5_hashes.add(data_hash)
-                insert_md5(data_hash, img_path, thread_dir_name)
+                insert_md5(data_hash, img_path, thread_id)
 
                 # Also copy the file into the `new/` directory layout so that
                 # external tools can easily pick up newly downloaded images.
