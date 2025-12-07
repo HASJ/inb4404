@@ -125,9 +125,11 @@ def main() -> None:
         help='save original filenames'
     )
     parser.add_argument(
-        '--subject',
-        action='store_true',
-        help='use thread subject in directory name'
+        '--no-subject',
+        dest='subject',
+        action='store_false',
+        default=True,
+        help="disable using thread subject in directory name (enabled by default)"
     )
     parser.add_argument(
         '--new-dir',

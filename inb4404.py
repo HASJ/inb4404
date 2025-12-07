@@ -9,4 +9,8 @@
 if __name__ == '__main__':
     # Import and run the main function from the package
     from inb4404.__main__ import main
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Graceful exit on Ctrl+C from the user (avoid full traceback)
+        pass
