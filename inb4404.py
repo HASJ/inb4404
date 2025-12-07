@@ -141,7 +141,8 @@ def main():
 
     The argument parsing below wires several feature flags and timings that
     control behavior such as throttling between downloads, whether to
-    preserve original file names, and whether to reload the queue file.
+    preserve original file names, whether to create a separate 'new'
+    directory for recent downloads, and whether to reload the queue file.
 
     Returns:
         None
@@ -157,7 +158,7 @@ def main():
     parser.add_argument('-n', '--use-names', action='store_true', help='use thread names instead of the thread ids (...4chan.org/board/thread/thread-id/thread-name)')
     parser.add_argument('-r', '--reload', action='store_true', help='reload the queue file every 5 minutes')
     parser.add_argument('-t', '--title', action='store_true', help='save original filenames')
-    parser.add_argument(      '--no-new-dir', action='store_true', help='don\'t create the `new` directory')
+    parser.add_argument(      '--new-dir', action='store_true', help='create the `new` directory')
     parser.add_argument(      '--refresh-time', type=float, default=20, help='Delay in seconds before refreshing the thread')
     parser.add_argument(      '--reload-time', type=float, default=5, help='Delay in minutes before reloading the file. Default: 5')
     parser.add_argument(      '--throttle', type=float, default=0.5, help='Delay in seconds between downloads in the same thread')
@@ -512,23 +513,45 @@ def download_thread(thread_link, args):
                 if len(enum_tuple) >= 7:
                     ext = enum_tuple[6]
 
-                if args.title and 'all_titles' in locals() and len(all_titles) > enum_index:
-                    imgname = all_titles[enum_index]
-                    try:
-                        from django.utils.text import get_valid_filename  # prefer Django if available
-                    except Exception:
-                        # Lightweight fallback of Django's get_valid_filename to avoid a hard dependency
-                        def get_valid_filename(s):
-                            s = str(s).strip()
-                            # remove characters that are not word chars, dot, dash or space
-                            s = re.sub(r'(?u)[^-\w.\s]', '', s)
-                            # replace spaces with underscores to produce a safe filename
-                            s = s.replace(' ', '_')
-                            if not s:
-                                s = 'file'
-                            return s
-                    img_path = os.path.join(directory, get_valid_filename(imgname))
-                else:
+                # Logic for naming the file when --title is used
+                # Priority:
+                # 1. Use original filename from API (if available)
+                # 2. Use title extracted from HTML (if available)
+                # 3. Fallback to default naming (else block)
+                if args.title:
+                    imgname = None
+                    # Use original_name from API if available. Note: API 'filename' usually lacks extension.
+                    if original_name:
+                        file_ext = ext if ext else os.path.splitext(img or '')[1]
+                        imgname = original_name + (file_ext or '')
+                    # Fallback to HTML-extracted title
+                    elif 'all_titles' in locals() and len(all_titles) > enum_index:
+                        imgname = all_titles[enum_index]
+
+                    if imgname:
+                        try:
+                            from django.utils.text import get_valid_filename  # prefer Django if available
+                        except Exception:
+                            # Lightweight fallback of Django's get_valid_filename to avoid a hard dependency
+                            def get_valid_filename(s):
+                                s = str(s).strip()
+                                # remove characters that are not word chars, dot, dash or space
+                                s = re.sub(r'(?u)[^-\w.\s]', '', s)
+                                # replace spaces with underscores to produce a safe filename
+                                s = s.replace(' ', '_')
+                                if not s:
+                                    s = 'file'
+                                return s
+                        img_path = os.path.join(directory, get_valid_filename(imgname))
+                    else:
+                        # Fallback to normal behavior if we couldn't determine a title
+                        # (This duplicates logic from the 'else' block below, but effectively
+                        # if imgname is None we just fall through to the else logic?
+                        # No, python doesn't support fallthrough. We need to handle the 'else' logic carefully.)
+                        pass
+
+                # If args.title was False, OR if it was True but we couldn't find a name (imgname is None)
+                if not args.title or (args.title and not locals().get('imgname')):
                     # Allow user to choose original server filename (when available)
                     chosen_name = img
                     if args.origin_name:
@@ -635,8 +658,8 @@ def download_thread(thread_link, args):
 
                 # Also copy the file into the `new/` directory layout so that
                 # external tools can easily pick up newly downloaded images.
-                # This is optional and controlled by `--no-new-dir`.
-                if not args.no_new_dir:
+                # This is optional and controlled by `--new-dir`.
+                if args.new_dir:
                     copy_directory = os.path.join(workpath, 'new', board, thread)
                     if not os.path.exists(copy_directory):
                         os.makedirs(copy_directory)
