@@ -125,6 +125,14 @@ class ThreadWatcher:
                     pass
                 continue
 
+            try:
+                stats = os.stat(full_path)
+                mtime = int(stats.st_mtime)
+                size = stats.st_size
+            except OSError as e:
+                log.warning(f'Could not stat file: {full_path}: {e}')
+                continue
+
             # Compute hash
             file_hash = self.file_manager.compute_hash(full_path)
             if not file_hash:
@@ -142,11 +150,11 @@ class ThreadWatcher:
                     log.warning(f'Could not remove duplicate file {full_path}: {e}')
             # If the stored path doesn't exist (file was moved/deleted), update the DB
             elif gpath and not os.path.exists(gpath):
-                self.db.upsert(file_hash, full_path, self.thread_id)
+                self.db.upsert(file_hash, full_path, self.thread_id, mtime, size)
 
             # Add to per-thread set and ensure DB entry
             self.md5_hashes.add(file_hash)
-            self.db.upsert(file_hash, full_path, self.thread_id)
+            self.db.upsert(file_hash, full_path, self.thread_id, mtime, size)
 
     def _fetch_thread_data(self) -> Tuple[List[Tuple], List[str]]:
         """Fetch thread data and extract file entries.
@@ -364,10 +372,19 @@ class ThreadWatcher:
         # Write file
         with open(img_path, 'wb') as f:
             f.write(data)
+        
+        try:
+            stats = os.stat(img_path)
+            mtime = int(stats.st_mtime)
+            size = stats.st_size
+        except OSError as e:
+            log.warning(f'Could not stat file for insert: {img_path}: {e}')
+            mtime = int(time.time())
+            size = len(data)
 
         # Update hashes and DB
         self.md5_hashes.add(data_hash)
-        self.db.insert(data_hash, img_path, self.thread_id)
+        self.db.insert(data_hash, img_path, self.thread_id, mtime, size)
 
         # Log
         filename_only = os.path.basename(img_path)

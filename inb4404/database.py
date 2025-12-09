@@ -2,7 +2,7 @@
 import sqlite3
 import time
 import logging
-from typing import Optional, Set
+from typing import Optional, Set, Tuple
 import os
 from contextlib import contextmanager
 
@@ -62,6 +62,18 @@ class HashDB:
                     'CREATE TABLE IF NOT EXISTS hashes '
                     '(md5 TEXT PRIMARY KEY, path TEXT, thread TEXT, ts INTEGER)'
                 )
+
+                # Check for mtime and size columns
+                cur.execute('PRAGMA table_info(hashes)')
+                columns = [row[1] for row in cur.fetchall()]
+                if 'mtime' not in columns:
+                    cur.execute('ALTER TABLE hashes ADD COLUMN mtime INTEGER')
+                if 'size' not in columns:
+                    cur.execute('ALTER TABLE hashes ADD COLUMN size INTEGER')
+                
+                # Add an index on the path column for faster lookups
+                cur.execute('CREATE INDEX IF NOT EXISTS idx_hashes_path ON hashes(path)')
+
                 conn.commit()
         except Exception as e:
             log.warning(f'Could not initialize hashes DB: {e}')
@@ -84,6 +96,22 @@ class HashDB:
         except Exception:
             return None
 
+    def get_file_metadata(self, path: str) -> Optional[Tuple[str, int, int]]:
+        """Return stored md5, mtime and size for `path` or None when not present.
+        Args:
+            path: The file path to look up.
+        Returns:
+            A tuple of (md5, mtime, size), or None if not found.
+        """
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT md5, mtime, size FROM hashes WHERE path=?', (path,))
+                row = cur.fetchone()
+                return row if row else None
+        except Exception:
+            return None
+
     def has_hash(self, md5: str) -> bool:
         """Check if the given MD5 hash exists in the database.
 
@@ -95,24 +123,26 @@ class HashDB:
         """
         return self.get_path(md5) is not None
 
-    def insert(self, md5: str, path: str, thread_name: str) -> None:
+    def insert(self, md5: str, path: str, thread_name: str, mtime: int, size: int) -> None:
         """Insert md5->path mapping. Uses INSERT OR IGNORE to avoid races.
 
         Args:
             md5: The MD5 hash of the file.
             path: The file path.
             thread_name: The name/ID of the thread.
+            mtime: The modification time of the file.
+            size: The size of the file.
         """
         try:
             with self._get_connection() as conn:
                 conn.execute(
-                    'INSERT OR IGNORE INTO hashes (md5, path, thread, ts) VALUES (?,?,?,?)',
-                    (md5, path, thread_name, int(time.time()))
+                    'INSERT OR IGNORE INTO hashes (md5, path, thread, ts, mtime, size) VALUES (?,?,?,?,?,?)',
+                    (md5, path, thread_name, int(time.time()), mtime, size)
                 )
         except Exception as e:
             log.warning(f'Could not write to hashes DB: {e}')
 
-    def upsert(self, md5: str, path: str, thread_name: str) -> None:
+    def upsert(self, md5: str, path: str, thread_name: str, mtime: int, size: int) -> None:
         """Insert or replace the md5->path mapping.
 
         Used after dedupe to ensure the DB points to the kept file path.
@@ -121,12 +151,14 @@ class HashDB:
             md5: The MD5 hash of the file.
             path: The file path.
             thread_name: The name/ID of the thread.
+            mtime: The modification time of the file.
+            size: The size of the file.
         """
         try:
             with self._get_connection() as conn:
                 conn.execute(
-                    'INSERT OR REPLACE INTO hashes (md5, path, thread, ts) VALUES (?,?,?,?)',
-                    (md5, path, thread_name, int(time.time()))
+                    'INSERT OR REPLACE INTO hashes (md5, path, thread, ts, mtime, size) VALUES (?,?,?,?,?,?)',
+                    (md5, path, thread_name, int(time.time()), mtime, size)
                 )
         except Exception as e:
             log.warning(f'Could not upsert into hashes DB: {e}')

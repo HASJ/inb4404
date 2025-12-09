@@ -1,7 +1,7 @@
 """Deduplication logic for removing duplicate files."""
 import os
 import logging
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from .config import Config
 from .database import HashDB
@@ -27,13 +27,15 @@ class Deduplicator:
         self.file_manager = FileManager()
         self.downloads_root = os.path.join(workpath, 'downloads')
 
-    def scan_directory(self) -> Dict[str, List[str]]:
+    def scan_directory(self) -> Dict[str, List[Tuple[str, int, int]]]:
         """Scan the downloads directory and collect files by MD5 hash.
-
+        This method will first check the database for a file's metadata. If the
+        file's modification time and size have not changed, it will use the
+        hash from the database. Otherwise, it will re-hash the file.
         Returns:
-            A dictionary mapping MD5 hashes to lists of file paths.
+            A dictionary mapping MD5 hashes to lists of (file_path, mtime, size) tuples.
         """
-        md5_map: Dict[str, List[str]] = {}
+        md5_map: Dict[str, List[Tuple[str, int, int]]] = {}
 
         if not os.path.exists(self.downloads_root):
             log.warning(f'No downloads directory found at {self.downloads_root}')
@@ -42,54 +44,50 @@ class Deduplicator:
         if self.config.verbose:
             log.info(f'Scanning files in downloads directory: {self.downloads_root}')
 
-        # Collect files and their MD5s
         for root, dirs, files in os.walk(self.downloads_root):
             for fn in files:
                 if fn == '.hashes.txt':
                     continue
-                full = os.path.join(root, fn)
-                if not os.path.isfile(full):
+                full_path = os.path.join(root, fn)
+                if not os.path.isfile(full_path):
                     continue
-                h = self.file_manager.compute_hash(full)
-                if not h:
-                    log.warning(f'Could not read file for hashing: {full}')
-                    continue
-                md5_map.setdefault(h, []).append(full)
-                if self.config.verbose:
-                    log.info(f'Hashed: {full} -> {h}')
 
+                try:
+                    stats = os.stat(full_path)
+                    mtime = int(stats.st_mtime)
+                    size = stats.st_size
+                except OSError as e:
+                    log.warning(f'Could not stat file: {full_path}: {e}')
+                    continue
+
+                metadata = self.db.get_file_metadata(full_path)
+                if metadata:
+                    db_md5, db_mtime, db_size = metadata
+                    if db_mtime == mtime and db_size == size:
+                        md5_map.setdefault(db_md5, []).append((full_path, mtime, size))
+                        if self.config.verbose:
+                            log.debug(f'Skipping hash for {full_path} (mtime and size match)')
+                        continue
+
+                h = self.file_manager.compute_hash(full_path)
+                if not h:
+                    log.warning(f'Could not read file for hashing: {full_path}')
+                    continue
+
+                md5_map.setdefault(h, []).append((full_path, mtime, size))
+                if self.config.verbose:
+                    log.info(f'Hashed: {full_path} -> {h}')
+        
         if self.config.verbose:
             total_files = sum(len(v) for v in md5_map.values())
             log.info(f'Found {total_files} files, {len(md5_map)} unique hashes')
 
         return md5_map
 
-    def find_duplicates(self, md5_map: Dict[str, List[str]]) -> Dict[str, tuple]:
-        """Find duplicate files, keeping the oldest for each hash.
-
-        Args:
-            md5_map: Dictionary mapping MD5 hashes to lists of file paths.
-
-        Returns:
-            A dictionary mapping MD5 hashes to (kept_path, duplicate_paths) tuples.
-        """
-        duplicates = {}
-        for h, paths in md5_map.items():
-            if len(paths) <= 1:
-                continue  # No duplicates
-            # Sort by mtime ascending (oldest first)
-            paths_sorted = sorted(paths, key=lambda p: os.path.getmtime(p))
-            kept = paths_sorted[0]
-            duplicate_paths = paths_sorted[1:]
-            duplicates[h] = (kept, duplicate_paths)
-        return duplicates
-
-    def remove_duplicates(self, md5_map: Dict[str, List[str]]) -> tuple:
+    def remove_duplicates(self, md5_map: Dict[str, List[Tuple[str, int, int]]]) -> tuple:
         """Remove duplicate files, keeping the oldest for each hash.
-
         Args:
-            md5_map: Dictionary mapping MD5 hashes to lists of file paths.
-
+            md5_map: Dictionary mapping MD5 hashes to lists of (file_path, mtime, size) tuples.
         Returns:
             A tuple of (kept_count, deleted_count).
         """
@@ -99,40 +97,40 @@ class Deduplicator:
         for h, paths in md5_map.items():
             if len(paths) > 1:
                 # Sort by mtime ascending (oldest first)
-                paths_sorted = sorted(paths, key=lambda p: os.path.getmtime(p))
-                kept = paths_sorted[0]
+                paths_sorted = sorted(paths, key=lambda p: p[1])
+                kept_path, mtime, size = paths_sorted[0]
                 duplicates = paths_sorted[1:]
 
-                log.info(f'Found {len(duplicates)} duplicate(s) for hash {h}. Keeping oldest file: {os.path.basename(kept)}')
-
+                log.info(f'Found {len(duplicates)} duplicate(s) for hash {h}. Keeping oldest file: {os.path.basename(kept_path)}')
+                
                 # Upsert the kept file's hash into the database
-                rel = os.path.relpath(kept, self.downloads_root)
+                rel = os.path.relpath(kept_path, self.downloads_root)
                 thread_name = os.path.dirname(rel).replace(os.sep, '/')
-                self.db.upsert(h, kept, thread_name)
+                self.db.upsert(h, kept_path, thread_name, mtime, size)
                 
                 if self.config.verbose:
-                    log.info(f'  Updated database with hash {h} for {kept}')
+                    log.info(f'  Updated database with hash {h} for {kept_path}')
 
-                for d in duplicates:
+                for d_path, _, _ in duplicates:
                     try:
-                        os.remove(d)
+                        os.remove(d_path)
                         deleted_count += 1
                         if self.config.verbose:
-                           log.info(f'  Deleted duplicate file: {d}')
+                           log.info(f'  Deleted duplicate file: {d_path}')
                     except Exception as e:
-                        log.warning(f'Could not remove duplicate file {d}: {e}')
-
+                        log.warning(f'Could not remove duplicate file {d_path}: {e}')
+                
                 kept_count += 1
             else:
                 # No duplicates, just ensure hash is in DB
-                kept = paths[0]
-                rel = os.path.relpath(kept, self.downloads_root)
+                kept_path, mtime, size = paths[0]
+                rel = os.path.relpath(kept_path, self.downloads_root)
                 thread_name = os.path.dirname(rel).replace(os.sep, '/')
-                self.db.upsert(h, kept, thread_name)
+                self.db.upsert(h, kept_path, thread_name, mtime, size)
                 if self.config.verbose:
-                    log.info(f'Added/updated hash {h} for {os.path.basename(kept)} in the database.')
+                    log.info(f'Added/updated hash {h} for {os.path.basename(kept_path)} in the database.')
                 kept_count += 1
-
+        
         return (kept_count, deleted_count)
 
     def remove_legacy_files(self) -> None:
