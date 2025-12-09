@@ -118,6 +118,11 @@ class HTTPClient:
             response = urllib.request.urlopen(req)
             data = response.read().decode('utf-8')
             return json.loads(data)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise ThreadNotFoundError(f'Thread not found: {board}/{thread_id}') from e
+            log.debug(f"HTTP error {e.code} fetching thread API for {board}/{thread_id}: {e}")
+            return None
         except Exception as e:
             log.debug(f"Failed to fetch thread API for {board}/{thread_id}: {e}")
             return None

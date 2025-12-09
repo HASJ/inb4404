@@ -97,35 +97,41 @@ class Deduplicator:
         deleted_count = 0
 
         for h, paths in md5_map.items():
-            # Sort by mtime ascending (oldest first)
-            paths_sorted = sorted(paths, key=lambda p: os.path.getmtime(p))
-            kept = paths_sorted[0]
-            duplicates = paths_sorted[1:]
+            if len(paths) > 1:
+                # Sort by mtime ascending (oldest first)
+                paths_sorted = sorted(paths, key=lambda p: os.path.getmtime(p))
+                kept = paths_sorted[0]
+                duplicates = paths_sorted[1:]
 
-            if duplicates:
-                kept_count += 1
-                # Determine thread name relative to downloads root
+                log.info(f'Found {len(duplicates)} duplicate(s) for hash {h}. Keeping oldest file: {os.path.basename(kept)}')
+
+                # Upsert the kept file's hash into the database
                 rel = os.path.relpath(kept, self.downloads_root)
                 thread_name = os.path.dirname(rel).replace(os.sep, '/')
-                # Ensure DB points to the kept path
                 self.db.upsert(h, kept, thread_name)
-
+                
                 if self.config.verbose:
-                    log.info(f'Hash {h}: keeping {kept}, deleting {len(duplicates)} duplicates')
+                    log.info(f'  Updated database with hash {h} for {kept}')
 
                 for d in duplicates:
                     try:
                         os.remove(d)
                         deleted_count += 1
-                        log.info(f'Removed duplicate: {d} (kept {kept})')
+                        if self.config.verbose:
+                           log.info(f'  Deleted duplicate file: {d}')
                     except Exception as e:
-                        log.warning(f'Failed to remove duplicate {d}: {e}')
-            else:
-                # No duplicates, but ensure DB entry exists
+                        log.warning(f'Could not remove duplicate file {d}: {e}')
+
                 kept_count += 1
+            else:
+                # No duplicates, just ensure hash is in DB
+                kept = paths[0]
                 rel = os.path.relpath(kept, self.downloads_root)
                 thread_name = os.path.dirname(rel).replace(os.sep, '/')
                 self.db.upsert(h, kept, thread_name)
+                if self.config.verbose:
+                    log.info(f'Added/updated hash {h} for {os.path.basename(kept)} in the database.')
+                kept_count += 1
 
         return (kept_count, deleted_count)
 

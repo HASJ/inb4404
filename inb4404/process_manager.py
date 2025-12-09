@@ -127,7 +127,7 @@ class ProcessManager:
         process.join(timeout=5)  # Give it a moment to die
         del self.running_processes[link]
 
-    def check_dead_processes(self) -> None:
+    def check_dead_processes(self) -> Set[str]:
         """Check for dead processes and handle them appropriately."""
         dead_links = []
         for link, process in self.running_processes.items():
@@ -136,18 +136,25 @@ class ProcessManager:
                 dead_links.append(link)
 
         if not dead_links:
-            return
+            return set()
 
+        disabled_links: Set[str] = set()
         max_restarts = 3
         for link in dead_links:
-            self._handle_dead_process(link, max_restarts)
+            if self._handle_dead_process(link, max_restarts):
+                disabled_links.add(link)
+        
+        return disabled_links
 
-    def _handle_dead_process(self, link: str, max_restarts: int) -> None:
+    def _handle_dead_process(self, link: str, max_restarts: int) -> bool:
         """Handle a dead process - check exit code, probe, and restart if needed.
 
         Args:
             link: The thread URL of the dead process.
             max_restarts: Maximum number of restart attempts.
+        
+        Returns:
+            True if the link was disabled, False otherwise.
         """
         log.info(f'Watcher for {link} appears to have stopped; probing and attempting restart.')
 
@@ -163,7 +170,7 @@ class ProcessManager:
         if exitcode == 404:
             self._disable_link(link, reason='404')
             self.running_processes.pop(link, None)
-            return
+            return True
 
         # Quick probe: try to load the thread page to detect 404s
         is_404 = False
@@ -178,7 +185,7 @@ class ProcessManager:
         if is_404:
             self._disable_link(link, reason='404')
             self.running_processes.pop(link, None)
-            return
+            return True
 
         # Not a 404. Try restarting the watcher
         restarted = False
@@ -216,6 +223,9 @@ class ProcessManager:
         if not restarted:
             self._disable_link(link, reason='after failed restarts')
             self.running_processes.pop(link, None)
+            return True
+        
+        return False
 
     def _disable_link(self, link: str, reason: str) -> None:
         """Disable a link in the queue file by prefixing with '-'.
@@ -227,72 +237,94 @@ class ProcessManager:
         try:
             with open(self.filename, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-            new_lines = []
-            disabled = False
-            for line in lines:
-                stripped = line.strip()
-                if stripped == link and not line.startswith('-'):
-                    new_lines.append('-' + line)
-                    disabled = True
-                    log.info(f'Disabled {stripped} in {self.filename} ({reason})')
-                else:
-                    new_lines.append(line)
-            if disabled:
+
+            # Find the line index to modify
+            line_index_to_disable = -1
+            for i, line in enumerate(lines):
+                # Match the link by comparing stripped content
+                if line.strip() == link:
+                    line_index_to_disable = i
+                    break
+            
+            # If we found a line to disable, modify it.
+            if line_index_to_disable != -1:
+                # Check if it's already disabled (ignoring leading whitespace)
+                if lines[line_index_to_disable].lstrip().startswith('-'):
+                    log.info(f"Link '{link}' is already disabled in {self.filename}.")
+                    return
+
+                # Prepend the dash to the original line content
+                lines[line_index_to_disable] = '-' + lines[line_index_to_disable]
+                log.info(f'Disabled {link} in {self.filename} ({reason})')
+
+                # Write the modified lines back to the file
                 with open(self.filename, 'w', encoding='utf-8') as f:
-                    f.writelines(new_lines)
+                    f.writelines(lines)
+            else:
+                log.warning(f"Could not find link '{link}' in {self.filename} to disable it.")
+
         except IOError as e:
             log.error(f'Error writing to file {self.filename}: {e}')
 
     def run(self) -> None:
         """Main run loop - manages watcher processes."""
-        while True:
-            # Load queue
-            desired_links = self.load_queue()
+        try:
+            while True:
+                # Load queue
+                desired_links = self.load_queue()
 
-            if self.config.verbose:
-                log.info(
-                    f'Loaded {len(desired_links)} links from {self.filename}; '
-                    f'{len(self.running_processes)} watchers currently running.'
-                )
-                # Show which links are new vs already running
-                current = set(self.running_processes.keys())
-                new_links = desired_links - current
-                removed = current - desired_links
-                if new_links:
-                    log.info('New links to start: ' + ', '.join(sorted(new_links)))
-                if removed:
-                    log.info('Links present but not in file: ' + ', '.join(sorted(removed)))
-
-            if not desired_links and not self.running_processes:
-                log.warning(f'{self.filename} is empty or all links are disabled.')
-
-            # Check for dead processes
-            self.check_dead_processes()
-
-            # Start new processes for new links
-            for link in desired_links:
-                if link not in self.running_processes:
-                    self.start_watcher(link)
-
-            # Stop processes for links that have been removed from the file
-            removed_links = [
-                link for link in self.running_processes
-                if link not in desired_links
-            ]
-            for link in removed_links:
-                self.stop_watcher(link)
-
-            if not self.config.reload:
-                # If not reloading, wait for all spawned processes to complete
-                for process in self.running_processes.values():
-                    process.join()
-                break
-            else:
-                # If reloading, wait for the specified time before checking again
                 if self.config.verbose:
                     log.info(
-                        f'Reloading {self.filename} in {self.config.reload_time} minutes. '
-                        f'Watching {len(self.running_processes)} threads.'
+                        f'Loaded {len(desired_links)} links from {self.filename}; '
+                        f'{len(self.running_processes)} watchers currently running.'
                     )
-                time.sleep(60 * self.config.reload_time)
+                    # Show which links are new vs already running
+                    current = set(self.running_processes.keys())
+                    new_links = desired_links - current
+                    removed = current - desired_links
+                    if new_links:
+                        log.info('New links to start: ' + ', '.join(sorted(new_links)))
+                    if removed:
+                        log.info('Links present but not in file: ' + ', '.join(sorted(removed)))
+
+                if not desired_links and not self.running_processes:
+                    log.warning(f'{self.filename} is empty or all links are disabled.')
+
+                # Check for dead processes
+                disabled_in_run = self.check_dead_processes()
+                desired_links.difference_update(disabled_in_run)
+
+                # Start new processes for new links
+                for link in desired_links:
+                    if link not in self.running_processes:
+                        self.start_watcher(link)
+                        
+                # Stop processes for links that have been removed from the file
+                removed_links = [
+                    link for link in self.running_processes
+                    if link not in desired_links
+                ]
+                for link in removed_links:
+                    self.stop_watcher(link)
+
+                if not self.config.reload:
+                    # If not reloading, wait for all spawned processes to complete
+                    for process in self.running_processes.values():
+                        process.join()
+                    break
+                else:
+                    # If reloading, wait for the specified time before checking again
+                    if self.config.verbose:
+                        log.info(
+                            f'Reloading {self.filename} in {self.config.reload_time} minutes. '
+                            f'Watching {len(self.running_processes)} threads.'
+                        )
+                    time.sleep(60 * self.config.reload_time)
+        except KeyboardInterrupt:
+            log.info('Ctrl+C detected. Shutting down all watcher processes...')
+            for link, process in self.running_processes.items():
+                log.info(f'Terminating watcher for {link}')
+                process.terminate()
+                process.join(timeout=5)
+            log.info('All watchers have been shut down.')
 

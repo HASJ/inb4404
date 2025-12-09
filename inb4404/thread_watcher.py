@@ -146,7 +146,7 @@ class ThreadWatcher:
 
             # Add to per-thread set and ensure DB entry
             self.md5_hashes.add(file_hash)
-            self.db.insert(file_hash, full_path, self.thread_id)
+            self.db.upsert(file_hash, full_path, self.thread_id)
 
     def _fetch_thread_data(self) -> Tuple[List[Tuple], List[str]]:
         """Fetch thread data and extract file entries.
@@ -195,6 +195,8 @@ class ThreadWatcher:
                 all_titles = self.parser.extract_titles(html_result)
 
             return (items, all_titles)
+        except (ThreadNotFoundError, HTTPError):
+            raise
         except Exception as e:
             log.warning(f'Failed to fetch thread data: {e}')
             return ([], [])
@@ -405,6 +407,12 @@ class ThreadWatcher:
                 # Process each file entry
                 for enum_index, enum_tuple in enumerate(items):
                     count = self._process_file_entry(enum_tuple, enum_index, all_titles, total, count)
+
+            except ThreadNotFoundError:
+                # Thread 404'd - exit with code 404
+                log.info(f"Thread {self.thread_url} not found (404). Watcher exiting.")
+                import sys
+                raise SystemExit(404)
 
             except HTTPError as ex:
                 # Handle 429 Too Many Requests
