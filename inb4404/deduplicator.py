@@ -68,6 +68,12 @@ class Deduplicator:
                         if self.config.verbose:
                             log.debug(f'Skipping hash for {full_path} (mtime and size match)')
                         continue
+                    else:
+                        # Metadata mismatch implies the file changed.
+                        # The DB entry is stale and should be removed to prevent future confusion.
+                        if self.config.verbose:
+                            log.info(f'Metadata mismatch for {full_path}. invalidating DB entry.')
+                        self.db.delete_file_metadata(full_path)
 
                 h = self.file_manager.compute_hash(full_path)
                 if not h:
@@ -103,13 +109,14 @@ class Deduplicator:
 
                 log.info(f'Found {len(duplicates)} duplicate(s) for hash {h}. Keeping oldest file: {os.path.basename(kept_path)}')
                 
-                # Upsert the kept file's hash into the database
-                rel = os.path.relpath(kept_path, self.downloads_root)
-                thread_name = os.path.dirname(rel).replace(os.sep, '/')
-                self.db.upsert(h, kept_path, thread_name, mtime, size)
-                
-                if self.config.verbose:
-                    log.info(f'  Updated database with hash {h} for {kept_path}')
+                # Upsert the kept file's hash into the database only if needed
+                if self.db.get_path(h) != kept_path:
+                    rel = os.path.relpath(kept_path, self.downloads_root)
+                    thread_name = os.path.dirname(rel).replace(os.sep, '/')
+                    self.db.upsert(h, kept_path, thread_name, mtime, size)
+                    
+                    if self.config.verbose:
+                        log.info(f'  Updated database with hash {h} for {kept_path}')
 
                 for d_path, _, _ in duplicates:
                     try:
@@ -117,6 +124,9 @@ class Deduplicator:
                         deleted_count += 1
                         if self.config.verbose:
                            log.info(f'  Deleted duplicate file: {d_path}')
+                    except OSError as e:
+                        # Log specific OS errors (like PermissionError/FileInUse)
+                        log.error(f'Failed to delete duplicate {d_path}: {e}')
                     except Exception as e:
                         log.warning(f'Could not remove duplicate file {d_path}: {e}')
                 
@@ -124,6 +134,12 @@ class Deduplicator:
             else:
                 # No duplicates, just ensure hash is in DB
                 kept_path, mtime, size = paths[0]
+
+                # Check if hash mapping is already correct to avoid unnecessary writes
+                if self.db.get_path(h) == kept_path:
+                    kept_count += 1
+                    continue
+
                 rel = os.path.relpath(kept_path, self.downloads_root)
                 thread_name = os.path.dirname(rel).replace(os.sep, '/')
                 self.db.upsert(h, kept_path, thread_name, mtime, size)

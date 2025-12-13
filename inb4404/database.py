@@ -139,6 +139,7 @@ class HashDB:
                     'INSERT OR IGNORE INTO hashes (md5, path, thread, ts, mtime, size) VALUES (?,?,?,?,?,?)',
                     (md5, path, thread_name, int(time.time()), mtime, size)
                 )
+                conn.commit()
         except Exception as e:
             log.warning(f'Could not write to hashes DB: {e}')
 
@@ -160,8 +161,22 @@ class HashDB:
                     'INSERT OR REPLACE INTO hashes (md5, path, thread, ts, mtime, size) VALUES (?,?,?,?,?,?)',
                     (md5, path, thread_name, int(time.time()), mtime, size)
                 )
+                conn.commit()
         except Exception as e:
             log.warning(f'Could not upsert into hashes DB: {e}')
+
+    def delete_file_metadata(self, path: str) -> None:
+        """Delete metadata for a specific file path.
+
+        Args:
+            path: The file path to remove from the database.
+        """
+        try:
+            with self._get_connection() as conn:
+                conn.execute('DELETE FROM hashes WHERE path=?', (path,))
+                conn.commit()
+        except Exception as e:
+            log.warning(f'Could not delete from hashes DB: {e}')
 
     def get_thread_hashes(self, thread_id: str) -> Set[str]:
         """Get all MD5 hashes for a specific thread.
