@@ -2,6 +2,8 @@
 import os
 import time
 import logging
+import sys
+import threading
 from multiprocessing import Process
 from typing import Dict, Set, Optional
 
@@ -74,6 +76,8 @@ class ProcessManager:
         self.workpath = workpath
         self.running_processes: Dict[str, Process] = {}
         self.http_client = HTTPClient()
+        self._force_reload = threading.Event()
+        self._stop_input_thread = False
 
     def load_queue(self) -> Set[str]:
         """Load thread URLs from the queue file.
@@ -266,10 +270,47 @@ class ProcessManager:
         except IOError as e:
             log.error(f'Error writing to file {self.filename}: {e}')
 
+    def _input_listener(self) -> None:
+        """Background thread to listen for new URLs from stdin."""
+        while not self._stop_input_thread:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line.startswith('http'):
+                    log.info(f'New URL detected from input: {line}')
+                    # Append to file
+                    try:
+                        with open(self.filename, 'a', encoding='utf-8') as f:
+                            f.write(f'\n{line}')
+                        # Trigger reload
+                        self._force_reload.set()
+                    except IOError as e:
+                        log.error(f'Failed to append URL to {self.filename}: {e}')
+                elif line:
+                    log.warning(f'Ignored invalid input: {line}')
+            except ValueError:
+                # Can happen if stdin is closed
+                break
+            except Exception as e:
+                log.error(f'Error reading input: {e}')
+                break
+
     def run(self) -> None:
         """Main run loop - manages watcher processes."""
+        # Start input listener thread
+        input_thread = threading.Thread(target=self._input_listener, daemon=True)
+        input_thread.start()
+        
+        # Log instruction for user
+        log.info("Listening for new URLs. Paste a link and press Enter to add it.")
+
         try:
             while True:
+                # Clear the force reload event at start of loop
+                self._force_reload.clear()
+
                 # Load queue
                 desired_links = self.load_queue()
 
@@ -309,18 +350,54 @@ class ProcessManager:
 
                 if not self.config.reload:
                     # If not reloading, wait for all spawned processes to complete
-                    for process in self.running_processes.values():
-                        process.join()
-                    break
+                    # BUT, we still want to check for new inputs if the user provided any
+                    # even if reload=False was passed, we might want to support adding?
+                    # The original logic was: reload=False means "run once and exit when done".
+                    # However, "run once" with "interactive add" is ambiguous.
+                    # We will assume if they paste a link, they want it processed.
+                    
+                    # We wait on the force_reload event or for processes to finish.
+                    # Since join() is blocking, we can't easily wait for both input and join
+                    # without a loop.
+                    
+                    # Adapted logic:
+                    # We loop and check processes. If all dead/done, we break.
+                    # Unless a new link comes in.
+                    while True:
+                        if self._force_reload.is_set():
+                            # Break inner loop to reload queue
+                            break
+                        
+                        # Check if processes are still alive
+                        alive_count = sum(1 for p in self.running_processes.values() if p.is_alive())
+                        if alive_count == 0:
+                            # If no processes are running, we might be done.
+                            # But wait a bit to see if user pastes something?
+                            # For strict backward compatibility, if --reload wasn't passed,
+                            # we should exit. However, the user asked for this feature.
+                            # Let's keep the listener active for a short grace period or
+                            # just exit if the queue is genuinely empty/done.
+                            # For now, let's stick to the original "exit when done" behavior
+                            # unless the user triggers a reload explicitly.
+                            break
+                        
+                        time.sleep(1)
+                    
+                    if not self._force_reload.is_set():
+                        break # Exit main loop if we broke for "all done" reason
+                        
                 else:
-                    # If reloading, wait for the specified time before checking again
+                    # If reloading is enabled:
                     if self.config.verbose:
                         log.info(
                             f'Reloading {self.filename} in {self.config.reload_time} minutes. '
                             f'Watching {len(self.running_processes)} threads.'
                         )
-                    time.sleep(60 * self.config.reload_time)
+                    
+                    # Wait for reload time OR force reload event
+                    self._force_reload.wait(timeout=60 * self.config.reload_time)
         except KeyboardInterrupt:
+            self._stop_input_thread = True
             log.info('Ctrl+C detected. Shutting down all watcher processes...')
             for link, process in self.running_processes.items():
                 log.info(f'Terminating watcher for {link}')

@@ -1,11 +1,5 @@
-*.webm
-*.mp4
-*.jpg
-*.webp
-*.png
-*.gif
+*.webm|*.mp4|*.jpg|*.webp|*.png|*.gif|*.pyc
 links.txt
-*.pyc
 .hashes.txt
 hashes.db
 inb4404.pyb
@@ -14,3 +8,4 @@ inb4404b.py
 .gitignore
 inb4429.py
 downloads/
+__pycache__/

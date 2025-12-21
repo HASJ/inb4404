@@ -1,12 +1,15 @@
 # inb4404
 
-**inb4404** is a robust, lightweight, and efficient command-line utility for monitoring and downloading media from 4chan-style imageboards. It is a fork of the original [4chan-downloader](https://github.com/Exceen/4chan-downloader) with significant enhancements, most notably a powerful duplicate detection and removal system.
+> **inb4404** is a robust, lightweight, and efficient command-line utility for monitoring and downloading media from 4chan-style imageboards.
+
+It is a fork of the original [4chan-downloader](https://github.com/Exceen/4chan-downloader) with significant enhancements, most notably a powerful duplicate detection and removal system and interactive queue management.
 
 ## 🚀 Key Features
 
 *   **Automated Monitoring:** Continuously watches specified threads and downloads new images/videos as they appear.
 *   **Intelligent Deduplication:** Uses MD5 hashing to maintain a global database of files. Prevents re-downloading identical files across different threads and can clean up existing archives.
 *   **Concurrent Downloading:** Supports watching multiple threads simultaneously via a queue file.
+*   **Interactive Management:** Add new threads to the watch list dynamically by pasting URLs into the console while the program is running.
 *   **Resilience:** Handles rate limiting (HTTP 429) with exponential backoff and gracefully manages dead threads (404s).
 *   **Flexible Naming:** Options to use original filenames, server filenames, or thread titles.
 *   **API-First:** Prioritizes the JSON API for performance, falling back to HTML scraping only when necessary.
@@ -17,7 +20,7 @@
 *   **Python 3.6+**
 *   **Standard Library:** No external dependencies are required for core functionality.
 
-**Optional Dependencies:**
+### Optional Dependencies
 For the `--title` feature (saving files with the post title), the following are required:
 *   `beautifulsoup4`
 *   `django` (specifically for `get_valid_filename`)
@@ -56,7 +59,9 @@ Watch multiple threads defined in a text file.
 python inb4404.py queue.txt
 ```
 
-*   **Hot Reloading:** Use the `-r` / `--reload` flag to make the script re-read the file every 5 minutes. This allows you to add or remove threads without restarting the process.
+**Interactive Features:**
+*   **Hot Reloading:** Use the `-r` / `--reload` flag to make the script re-read the file every 5 minutes.
+*   **Dynamic Adding:** While running in list mode, you can paste a thread URL into the terminal and press Enter. The script will automatically add it to the queue file and start watching it immediately.
 *   **Dead Links:** If a thread 404s, the script will automatically comment it out in the file (prefixing with `-`).
 
 ### 3. Deduplication Mode
