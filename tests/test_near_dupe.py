@@ -150,6 +150,26 @@ class TestResolver(unittest.TestCase):
         self.assertFalse(os.path.isdir(
             os.path.join(self.thread, ORIGINAL_DIR, ORIGINAL_DIR)))
 
+    def test_counter_includes_displaced_held_copies(self):
+        """A winning file displaces several held copies; all must be counted."""
+        for name in ('a.webm', 'b.webm', 'c.webm'):
+            held = self._make(self.thread, name)
+            self.db.record_phash(held, meta([0x1234], width=640, height=480))
+        new = self._make(self.thread, 'best.webm')
+        returned = self.resolver.check(new, meta([0x1234], width=1920, height=1080))
+        # check() reports only the incoming file moving, which did not happen.
+        self.assertIsNone(returned)
+        self.assertEqual(self.resolver.relocated, 3)
+
+    def test_md5_row_follows_the_relocated_file(self):
+        held = self._make(self.thread, 'held.webm')
+        self.db.record_phash(held, meta([0x1234], width=640, height=480))
+        self.db.insert('deadbeef', held, '1234', 111, 222)
+        new = self._make(self.thread, 'new.webm')
+        self.resolver.check(new, meta([0x1234], width=1920, height=1080))
+        moved = os.path.join(self.thread, ORIGINAL_DIR, 'held_1.webm')
+        self.assertEqual(self.db.get_path('deadbeef'), moved)
+
     def test_is_set_aside(self):
         from inb4404.near_dupe import is_set_aside
         self.assertTrue(is_set_aside(os.path.join(self.thread, 'original', 'x.webm')))

@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 from .config import Config
 from .database import HashDB
 from .file_utils import FileManager
+from .near_dupe import ORIGINAL_DIR
 
 log = logging.getLogger('inb4404')
 
@@ -58,7 +59,7 @@ class Deduplicator:
         for root, dirs, files in os.walk(self.downloads_root):
             # Resolved near-duplicates live here; walking them would re-detect
             # every pair on every run.
-            dirs[:] = [d for d in dirs if d != 'original']
+            dirs[:] = [d for d in dirs if d != ORIGINAL_DIR]
             for fn in files:
                 if fn == '.hashes.txt':
                     continue
@@ -197,11 +198,10 @@ class Deduplicator:
             self.db, self.config.phash_distance, self.config.verbose
         )
         hashed = 0
-        resolved = 0
 
         with self.db.bulk_session() as conn:
             for root, dirs, files in os.walk(self.downloads_root):
-                dirs[:] = [d for d in dirs if d != 'original']
+                dirs[:] = [d for d in dirs if d != ORIGINAL_DIR]
                 for fn in files:
                     if fn == '.hashes.txt':
                         continue
@@ -220,12 +220,13 @@ class Deduplicator:
                             log.info(f'Perceptual hash: {full_path} '
                                      f'({len(meta.frames)} frames)')
 
-                    moved = resolver.check(full_path, meta,
-                                           allow_foreign_moves=True, conn=conn)
-                    if moved:
-                        resolved += 1
+                    resolver.check(full_path, meta,
+                                   allow_foreign_moves=True, conn=conn)
 
-        return (hashed, resolved)
+        # Read the resolver's own counter: check() reports only the incoming
+        # file being moved, while a winning file can displace several held
+        # copies in one call.
+        return (hashed, resolver.relocated)
 
     def remove_legacy_files(self) -> None:
         """Remove legacy .hashes.txt files."""

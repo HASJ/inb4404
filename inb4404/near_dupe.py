@@ -87,6 +87,29 @@ class NearDupeResolver(object):
         self.db = db
         self.distance = distance
         self.verbose = verbose
+        # Total files moved aside. Counted here rather than inferred from
+        # check()'s return value, which only reports the incoming file being
+        # relocated -- a winning file can displace several held copies in one
+        # call and those would go uncounted.
+        self.relocated = 0
+
+    def _set_aside(self, path: str, conn=None) -> Optional[str]:
+        """Relocate one file and repoint both tables at its new path.
+
+        Args:
+            path: Absolute path to the file to move.
+            conn: Optional open connection from `HashDB.bulk_session`.
+
+        Returns:
+            The new path, or None when the move failed.
+        """
+        moved = relocate(path)
+        if not moved:
+            return None
+        self.db.move_phash_path(path, moved, conn=conn)
+        self.db.move_hash_path(path, moved, conn=conn)
+        self.relocated += 1
+        return moved
 
     def check(self, path, meta, allow_foreign_moves: bool = False,
               conn=None) -> Optional[str]:
@@ -144,9 +167,8 @@ class NearDupeResolver(object):
                         os.path.basename(path), other_path
                     )
                     continue
-                moved = relocate(other_path)
+                moved = self._set_aside(other_path, conn=conn)
                 if moved:
-                    self.db.move_phash_path(other_path, moved, conn=conn)
                     log.info('Near-dupe: %s supersedes %s -> %s',
                              os.path.basename(path),
                              os.path.basename(other_path), moved)
@@ -155,9 +177,8 @@ class NearDupeResolver(object):
                 # run, making the pass non-idempotent.
                 continue
 
-            moved = relocate(path)
+            moved = self._set_aside(path, conn=conn)
             if moved:
-                self.db.move_phash_path(path, moved, conn=conn)
                 log.info('Near-dupe: %s superseded by %s -> %s',
                          os.path.basename(path),
                          os.path.basename(other_path), moved)
