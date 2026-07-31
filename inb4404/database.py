@@ -8,6 +8,7 @@ from contextlib import contextmanager
 
 from .config import DB_PATH_DEFAULT, DB_TIMEOUT
 from .exceptions import DatabaseError
+from . import perceptual
 
 log = logging.getLogger('inb4404')
 
@@ -74,6 +75,21 @@ class HashDB:
                 # Add an index on the path column for faster lookups
                 cur.execute('CREATE INDEX IF NOT EXISTS idx_hashes_path ON hashes(path)')
 
+                # Perceptual-hash frames. Kept in a separate table so the
+                # existing (md5, mtime, size) queries stay untouched -- they
+                # are unpacked positionally by callers.
+                cur.execute(
+                    'CREATE TABLE IF NOT EXISTS phash_frames ('
+                    'path TEXT NOT NULL, frame INTEGER NOT NULL, h TEXT NOT NULL, '
+                    'b0 INTEGER, b1 INTEGER, b2 INTEGER, b3 INTEGER, '
+                    'width INTEGER, height INTEGER, duration REAL, '
+                    'PRIMARY KEY (path, frame))'
+                )
+                for band in ('b0', 'b1', 'b2', 'b3'):
+                    cur.execute(
+                        'CREATE INDEX IF NOT EXISTS idx_phash_%s '
+                        'ON phash_frames(%s)' % (band, band)
+                    )
 
                 conn.commit()
         except Exception as e:
@@ -286,3 +302,170 @@ class HashDB:
                 return row[0] if row else 0
         except Exception:
             return 0
+
+    @contextmanager
+    def bulk_session(self):
+        """Yield one connection reused across many operations.
+
+        `_get_connection` opens and closes per call, which is correct for
+        watcher processes but costs ~0.5 ms per operation on a whole-tree
+        pass. Only use this from `Deduplicator`, which runs before any
+        watcher starts.
+
+        Yields:
+            An open sqlite3.Connection, committed and closed on exit.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=self.timeout)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    @contextmanager
+    def _session(self, conn):
+        """Yield `conn` when given, otherwise a short-lived connection."""
+        if conn is not None:
+            yield conn
+        else:
+            owned = sqlite3.connect(self.db_path, timeout=self.timeout)
+            try:
+                yield owned
+                owned.commit()
+            finally:
+                try:
+                    owned.close()
+                except Exception:
+                    pass
+
+    def record_phash(self, path, meta, conn=None) -> None:
+        """Store the perceptual frame hashes for one file.
+
+        Replaces any rows previously stored for `path`.
+
+        Args:
+            path: Absolute path to the media file.
+            meta: A `perceptual.MediaMeta` holding frames and dimensions.
+            conn: Optional open connection from `bulk_session`.
+        """
+        try:
+            with self._session(conn) as c:
+                c.execute('DELETE FROM phash_frames WHERE path=?', (path,))
+                rows = []
+                for i, h in enumerate(meta.frames):
+                    b0, b1, b2, b3 = perceptual.chunks(h)
+                    rows.append((path, i, perceptual.to_hex(h), b0, b1, b2, b3,
+                                 meta.width, meta.height, meta.duration))
+                c.executemany(
+                    'INSERT INTO phash_frames '
+                    '(path, frame, h, b0, b1, b2, b3, width, height, duration) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?)', rows
+                )
+        except Exception as e:
+            log.warning('Could not record phash for %s: %s', path, e)
+
+    def get_phash(self, path, conn=None):
+        """Load the stored perceptual hashes for one file.
+
+        Args:
+            path: Absolute path to the media file.
+            conn: Optional open connection from `bulk_session`.
+
+        Returns:
+            A `perceptual.MediaMeta`, or None when nothing is stored.
+        """
+        try:
+            with self._session(conn) as c:
+                cur = c.cursor()
+                cur.execute(
+                    'SELECT h, width, height, duration FROM phash_frames '
+                    'WHERE path=? ORDER BY frame', (path,)
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return None
+                frames = [perceptual.from_hex(r[0]) for r in rows]
+                return perceptual.MediaMeta(
+                    frames=frames, width=rows[0][1] or 0,
+                    height=rows[0][2] or 0, duration=rows[0][3] or 0.0
+                )
+        except Exception as e:
+            log.warning('Could not read phash for %s: %s', path, e)
+            return None
+
+    def has_phash(self, path, conn=None) -> bool:
+        """Report whether any frame rows exist for `path`."""
+        try:
+            with self._session(conn) as c:
+                cur = c.cursor()
+                cur.execute(
+                    'SELECT 1 FROM phash_frames WHERE path=? LIMIT 1', (path,)
+                )
+                return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    def find_phash_candidates(self, frame_chunks, exclude_path, conn=None):
+        """Return paths sharing a band value with any of the given frames.
+
+        Two hashes within Hamming distance 3 must agree exactly on at least
+        one 16-bit chunk, so this is a complete candidate set for that
+        distance -- the caller still verifies with a real comparison.
+
+        Args:
+            frame_chunks: One 4-tuple of band values per frame.
+            exclude_path: Path to omit, normally the file being checked.
+            conn: Optional open connection from `bulk_session`.
+
+        Returns:
+            A list of distinct candidate paths.
+        """
+        found = []
+        seen = set()
+        try:
+            with self._session(conn) as c:
+                cur = c.cursor()
+                for b0, b1, b2, b3 in frame_chunks:
+                    cur.execute(
+                        'SELECT DISTINCT path FROM phash_frames '
+                        'WHERE b0=? OR b1=? OR b2=? OR b3=?',
+                        (b0, b1, b2, b3)
+                    )
+                    for row in cur.fetchall():
+                        p = row[0]
+                        if p == exclude_path or p in seen:
+                            continue
+                        seen.add(p)
+                        found.append(p)
+        except Exception as e:
+            log.warning('Could not probe phash candidates: %s', e)
+        return found
+
+    def move_phash_path(self, old_path, new_path, conn=None) -> None:
+        """Repoint stored frame rows after a file is relocated.
+
+        Args:
+            old_path: The path the rows currently carry.
+            new_path: The path the file now lives at.
+            conn: Optional open connection from `bulk_session`.
+        """
+        try:
+            with self._session(conn) as c:
+                c.execute('DELETE FROM phash_frames WHERE path=?', (new_path,))
+                c.execute('UPDATE phash_frames SET path=? WHERE path=?',
+                          (new_path, old_path))
+        except Exception as e:
+            log.warning('Could not move phash rows %s -> %s: %s',
+                        old_path, new_path, e)
+
+    def delete_phash(self, path, conn=None) -> None:
+        """Remove all frame rows for `path`."""
+        try:
+            with self._session(conn) as c:
+                c.execute('DELETE FROM phash_frames WHERE path=?', (path,))
+        except Exception as e:
+            log.warning('Could not delete phash rows for %s: %s', path, e)
+
