@@ -55,6 +55,16 @@ class ThreadWatcher:
         # Per-thread hash set
         self.md5_hashes: Set[str] = set()
 
+        # Perceptual near-duplicate resolver. Built here rather than carried on
+        # Config, which is pickled into child processes and must stay a plain
+        # dataclass of picklable values.
+        self.resolver = None
+        if self.config.phash_enabled:
+            from .near_dupe import NearDupeResolver
+            self.resolver = NearDupeResolver(
+                self.db, self.config.phash_distance, self.config.verbose
+            )
+
         # Throttle (can be adjusted on 429)
         self.throttle = config.throttle
 
@@ -382,6 +392,10 @@ class ThreadWatcher:
             self._save_file(img_path, data, data_hash, total, count)
             count += 1
 
+            # Reaching here means the file survived both MD5 checks, so no
+            # ffmpeg process is ever spawned for a file MD5 already rejected.
+            self._phash_new_file(img_path)
+
             # Delay between downloads
             self._sleep(self.throttle)
 
@@ -414,6 +428,30 @@ class ThreadWatcher:
             log.warning(f'Unexpected error downloading {link}: {e}')
 
         return count
+
+    def _phash_new_file(self, img_path: str) -> None:
+        """Compute and record the perceptual hash of a newly saved file.
+
+        Runs only for files that survived both MD5 checks. Any failure is
+        logged and swallowed -- a watcher must never die because ffmpeg
+        misbehaved on one file.
+
+        Args:
+            img_path: Absolute path to the file just written.
+        """
+        if not self.resolver:
+            return
+        from . import perceptual
+        try:
+            meta = perceptual.extract(img_path)
+            if meta is None:
+                return
+            self.db.record_phash(img_path, meta)
+            # Foreign moves stay off here: a held file in another thread
+            # directory may belong to a sibling watcher process.
+            self.resolver.check(img_path, meta, allow_foreign_moves=False)
+        except Exception as e:
+            log.warning(f'Perceptual hashing failed for {img_path}: {e}')
 
     def _save_file(self, img_path: str, data: bytes, data_hash: str, total: int, count: int) -> None:
         """Save a downloaded file to disk.
