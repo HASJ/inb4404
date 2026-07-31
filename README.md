@@ -8,6 +8,7 @@ It is a fork of the original [4chan-downloader](https://github.com/Exceen/4chan-
 
 *   **Automated Monitoring:** Continuously watches specified threads and downloads new images/videos as they appear.
 *   **Intelligent Deduplication:** Uses MD5 hashing to maintain a global database of files. Prevents re-downloading identical files across different threads and can clean up existing archives.
+*   **Near-Duplicate Detection:** Perceptual hashing catches re-encodes, resizes and requantisations that MD5 cannot see. Nothing is deleted — the weaker copy is moved aside into an `original/` folder.
 *   **Concurrent Downloading:** Supports watching multiple threads simultaneously via a queue file.
 *   **Interactive Management:** Add new threads to the watch list dynamically by pasting URLs into the console while the program is running.
 *   **Resilience:** Handles rate limiting (HTTP 429) with exponential backoff and gracefully manages dead threads (404s).
@@ -24,6 +25,10 @@ It is a fork of the original [4chan-downloader](https://github.com/Exceen/4chan-
 For the `--title` feature (saving files with the post title), the following are required:
 *   `beautifulsoup4`
 *   `django` (specifically for `get_valid_filename`)
+
+For near-duplicate detection, the **ffmpeg** binary must be on your `PATH`. It is not a Python
+package — install it from [ffmpeg.org](https://ffmpeg.org) or your system package manager. If
+it is missing, the program logs one warning and runs normally with the feature disabled.
 
 ## 🛠️ Installation
 
@@ -71,6 +76,31 @@ Scan your existing `downloads/` directory to remove duplicate files, keeping onl
 python inb4404.py --dedupe-downloads
 ```
 
+This also computes perceptual hashes for any file that lacks one and resolves near-duplicates
+across every thread. The first run costs roughly 0.6 s per file; afterwards hashes are reused.
+
+### 4. Near-Duplicate Detection
+
+MD5 catches only byte-identical files. A re-encode, a resize, or a different quality setting
+produces a completely different MD5 while looking the same. Perceptual hashing catches those.
+
+The two layers are complementary, and the order matters:
+
+*   **MD5 runs first and saves bandwidth.** The 4chan API supplies each post's MD5, so an exact
+    repost is skipped *before* anything is downloaded.
+*   **Perceptual hashing runs afterwards and saves disk.** It needs the decoded pixels, so
+    every file it examines has already been downloaded in full. A file rejected by MD5 never
+    reaches it.
+
+When a near-duplicate pair is found, **nothing is deleted.** The loser is renamed with an `_N`
+suffix and moved into an `original/` folder beside its thread. The incoming file replaces the
+one already held only when it has more pixels *and* its duration is not shorter — so a
+high-resolution trimmed excerpt cannot displace a full-length video.
+
+Detection is global: a re-encode reposted in a different thread is still caught. Because a file
+in another thread may belong to a concurrent watcher process, cross-thread pairs found during
+live watching are logged and resolved on the next `--dedupe-downloads` run.
+
 ## ⚙️ Configuration & Options
 
 | Flag | Long Flag | Description |
@@ -88,6 +118,8 @@ python inb4404.py --dedupe-downloads
 | | `--reload-time` | Minutes to wait before reloading the queue file (default: 5). |
 | | `--throttle` | Seconds to wait between individual file downloads (default: 0.5). |
 | | `--dedupe-downloads` | Run the deduplication tool and exit. |
+| | `--no-phash` | Disable perceptual near-duplicate detection. |
+| | `--phash-distance` | Max Hamming distance for a near-duplicate frame pair (default: 3, max: 3). |
 
 ## 🤝 Contributing
 
