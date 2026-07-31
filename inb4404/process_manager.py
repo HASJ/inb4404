@@ -53,6 +53,9 @@ def _call_watcher(thread_url: str, config: Config, workpath: str) -> None:
     try:
         watcher = ThreadWatcher(thread_url, config, workpath)
         watcher.watch()
+    except ValueError as e:
+        log.error(f"Error starting watcher for {thread_url}: {e}")
+        raise SystemExit(404)
     except KeyboardInterrupt:
         pass
     except SystemExit as e:

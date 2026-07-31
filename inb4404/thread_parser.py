@@ -22,28 +22,50 @@ class ThreadURL:
 
     @classmethod
     def parse(cls, url: str) -> 'ThreadURL':
-        """Parse a thread URL into components.
+        """Parse and validate a thread URL into components.
 
         Args:
             url: The thread URL to parse.
 
         Returns:
             A ThreadURL instance with parsed components.
+
+        Raises:
+            ValueError: If the URL or components are malformed or invalid.
         """
-        # Remove fragment if present
-        url = url.split('#')[0]
-        parts = url.split('/')
-        
-        # Find the board (typically at index 3: https://boards.4chan.org/board/thread/...)
-        board = parts[3] if len(parts) > 3 else ''
-        
-        # Find thread_id (typically at index 5)
-        thread_id = parts[5] if len(parts) > 5 else ''
-        
-        # Find slug if present (typically at index 6)
-        slug = parts[6] if len(parts) > 6 else None
-        
+        # Parse URL
+        parsed_url = urlparse(url)
+        if not parsed_url.netloc:
+            raise ValueError(f"Invalid URL format: {url}")
+
+        # Validate domain (should end with 4chan.org or 4channel.org)
+        hostname = parsed_url.hostname or ''
+        if not (hostname.endswith('4chan.org') or hostname.endswith('4channel.org')):
+            raise ValueError(f"Unsupported domain: {hostname}. Only 4chan.org and 4channel.org are supported.")
+
+        # Clean path and split
+        path = parsed_url.path
+        parts = [p for p in path.strip('/').split('/') if p]
+
+        # A valid thread URL path must have the format: /board/thread/thread_id
+        if len(parts) < 3 or parts[1] != 'thread':
+            raise ValueError(f"Invalid thread URL path: {path}. Expected format: /board/thread/thread_id")
+
+        board = parts[0]
+        thread_id = parts[2]
+        slug = parts[3] if len(parts) > 3 else None
+
+        # Validate that board, thread_id, and slug (if present) are safe strings
+        pattern = re.compile(r'^[a-zA-Z0-9_-]+$')
+        if not pattern.match(board):
+            raise ValueError(f"Invalid board identifier: {board}")
+        if not pattern.match(thread_id):
+            raise ValueError(f"Invalid thread ID: {thread_id}")
+        if slug and not pattern.match(slug):
+            raise ValueError(f"Invalid slug: {slug}")
+
         return cls(url=url, board=board, thread_id=thread_id, slug=slug)
+
 
 
 class ThreadParser:
@@ -135,7 +157,7 @@ class ThreadParser:
         ret = []
 
         try:
-            from bs4 import BeautifulSoup, element as bs4_element
+            from bs4 import BeautifulSoup, element as bs4_element  # type: ignore
         except ImportError:
             log.warning("BeautifulSoup4 not available, cannot extract titles from HTML")
             return ret

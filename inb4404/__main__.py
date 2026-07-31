@@ -214,8 +214,12 @@ def main() -> None:
     thread = args.thread.strip()
     if thread[:4].lower() == 'http':
         # Single thread URL
-        watcher = ThreadWatcher(thread, config, config.workpath)
-        watcher.watch()
+        try:
+            watcher = ThreadWatcher(thread, config, config.workpath)
+            watcher.watch()
+        except ValueError as e:
+            log.error(f"Error starting watcher: {e}")
+            sys.exit(1)
     else:
         # File containing thread URLs
         manager = ProcessManager(thread, config, config.workpath)

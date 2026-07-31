@@ -72,7 +72,7 @@ class HTTPClient:
 
             headers = self._build_headers(url)
             req = urllib.request.Request(url, headers=headers)
-            response = urllib.request.urlopen(req)
+            response = urllib.request.urlopen(req, timeout=15.0)
             return response.read()
         except urllib.error.HTTPError as e:
             if e.code == 404:
@@ -115,7 +115,7 @@ class HTTPClient:
             api_url = f'https://a.4cdn.org/{board}/thread/{thread_id}.json'
             # Use simpler headers for API requests
             req = urllib.request.Request(api_url, headers={'User-Agent': self.USER_AGENT})
-            response = urllib.request.urlopen(req)
+            response = urllib.request.urlopen(req, timeout=15.0)
             data = response.read().decode('utf-8')
             return json.loads(data)
         except urllib.error.HTTPError as e:

@@ -242,42 +242,47 @@ class ThreadWatcher:
         if len(enum_tuple) >= 7:
             ext = enum_tuple[6]
 
+        raw_name = None
+
         # Logic for naming the file when --title is used
         if self.config.title:
-            imgname = None
             if original_name:
                 file_ext = ext if ext else os.path.splitext(img or '')[1]
-                imgname = original_name + (file_ext or '')
+                raw_name = original_name + (file_ext or '')
             elif len(all_titles) > enum_index:
-                imgname = all_titles[enum_index]
-
-            if imgname:
-                return os.path.join(self.directory, self.file_manager.sanitize_filename(imgname))
+                raw_name = all_titles[enum_index]
 
         # Default naming logic
-        chosen_name = img
-        if self.config.origin_name:
-            if original_name:
-                file_ext = ext if ext else os.path.splitext(img or '')[1]
-                chosen_name = original_name + (file_ext or '')
-            else:
-                base = os.path.basename(img or '')
-                stripped = re.sub(r'^[0-9]+(?:[._\-]+)?', '', base)
-                if stripped:
-                    chosen_name = stripped
+        if not raw_name:
+            chosen_name = img
+            if self.config.origin_name:
+                if original_name:
+                    file_ext = ext if ext else os.path.splitext(img or '')[1]
+                    chosen_name = original_name + (file_ext or '')
+                else:
+                    base = os.path.basename(img or '')
+                    stripped = re.sub(r'^[0-9]+(?:[._\-]+)?', '', base)
+                    if stripped:
+                        chosen_name = stripped
 
-        if not chosen_name:
-            if img:
-                fallback_name = os.path.basename(img)
-            elif tim:
-                fallback_name = str(tim) + (ext or '')
+            if not chosen_name:
+                if img:
+                    fallback_name = os.path.basename(img)
+                elif tim:
+                    fallback_name = str(tim) + (ext or '')
+                else:
+                    fallback_name = 'file'
+                raw_name = fallback_name
             else:
-                fallback_name = 'file'
-            safe_name = fallback_name
-        else:
-            safe_name = chosen_name
+                raw_name = chosen_name
 
-        return os.path.join(self.directory, safe_name)
+        if not raw_name:
+            return None
+
+        # Centralized sanitization to prevent path traversal and invalid characters
+        sanitized_name = self.file_manager.sanitize_filename(raw_name)
+        return os.path.join(self.directory, sanitized_name)
+
 
     def _process_file_entry(
         self,
