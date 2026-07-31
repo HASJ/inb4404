@@ -122,6 +122,39 @@ class TestResolver(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(other, ORIGINAL_DIR, 'held_1.webm')))
 
+    def test_resolves_every_weaker_copy_in_one_pass(self):
+        """A group of near-dupes must fully resolve in a single run."""
+        for name in ('a.webm', 'b.webm', 'c.webm'):
+            held = self._make(self.thread, name)
+            self.db.record_phash(held, meta([0x1234], width=640, height=480))
+        new = self._make(self.thread, 'best.webm')
+        self.resolver.check(new, meta([0x1234], width=1920, height=1080))
+        aside = os.path.join(self.thread, ORIGINAL_DIR)
+        self.assertEqual(sorted(os.listdir(aside)),
+                         ['a_1.webm', 'b_1.webm', 'c_1.webm'])
+        self.assertTrue(os.path.isfile(new))
+
+    def test_second_pass_is_idempotent(self):
+        """Re-checking must not relocate an already set-aside file again."""
+        held = self._make(self.thread, 'held.webm')
+        self.db.record_phash(held, meta([0x1234], width=640, height=480))
+        new = self._make(self.thread, 'new.webm')
+        winner_meta = meta([0x1234], width=1920, height=1080)
+        self.resolver.check(new, winner_meta)
+        self.db.record_phash(new, winner_meta)
+
+        before = sorted(os.listdir(os.path.join(self.thread, ORIGINAL_DIR)))
+        self.resolver.check(new, winner_meta)
+        after = sorted(os.listdir(os.path.join(self.thread, ORIGINAL_DIR)))
+        self.assertEqual(before, after)
+        self.assertFalse(os.path.isdir(
+            os.path.join(self.thread, ORIGINAL_DIR, ORIGINAL_DIR)))
+
+    def test_is_set_aside(self):
+        from inb4404.near_dupe import is_set_aside
+        self.assertTrue(is_set_aside(os.path.join(self.thread, 'original', 'x.webm')))
+        self.assertFalse(is_set_aside(os.path.join(self.thread, 'x.webm')))
+
     def test_stale_candidate_row_is_dropped(self):
         ghost = os.path.join(self.thread, 'ghost.webm')
         self.db.record_phash(ghost, meta([0x1234]))

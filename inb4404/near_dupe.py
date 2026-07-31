@@ -17,6 +17,22 @@ log = logging.getLogger('inb4404')
 ORIGINAL_DIR = 'original'
 
 
+def is_set_aside(path: str) -> bool:
+    """Report whether a path already lives inside an `original/` folder.
+
+    Files there were resolved on an earlier run. Both the directory walks and
+    the candidate scan skip them, so a repeated pass is idempotent.
+
+    Args:
+        path: Path to test.
+
+    Returns:
+        True when any component of the path is the `original/` folder.
+    """
+    parts = os.path.normpath(path).split(os.sep)
+    return ORIGINAL_DIR in parts
+
+
 def relocate(path: str) -> Optional[str]:
     """Move a file into a sibling `original/` folder, suffixing its stem.
 
@@ -101,6 +117,11 @@ class NearDupeResolver(object):
             frame_chunks, exclude_path=path, conn=conn)
 
         for other_path in candidates:
+            if is_set_aside(other_path):
+                # Already resolved on an earlier run. Comparing against it
+                # again would relocate it a second time, nesting original/
+                # inside original/ and making the pass non-idempotent.
+                continue
             other = self.db.get_phash(other_path, conn=conn)
             if other is None:
                 continue
@@ -122,14 +143,17 @@ class NearDupeResolver(object):
                         'process may own it, --dedupe-downloads will resolve)',
                         os.path.basename(path), other_path
                     )
-                    return None
+                    continue
                 moved = relocate(other_path)
                 if moved:
                     self.db.move_phash_path(other_path, moved, conn=conn)
                     log.info('Near-dupe: %s supersedes %s -> %s',
                              os.path.basename(path),
                              os.path.basename(other_path), moved)
-                return None
+                # Keep scanning: this file may beat several held copies, and
+                # resolving only the first would leave the rest for a later
+                # run, making the pass non-idempotent.
+                continue
 
             moved = relocate(path)
             if moved:
