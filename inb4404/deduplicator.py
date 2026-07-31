@@ -56,6 +56,9 @@ class Deduplicator:
         hashed = 0
 
         for root, dirs, files in os.walk(self.downloads_root):
+            # Resolved near-duplicates live here; walking them would re-detect
+            # every pair on every run.
+            dirs[:] = [d for d in dirs if d != 'original']
             for fn in files:
                 if fn == '.hashes.txt':
                     continue
@@ -173,6 +176,57 @@ class Deduplicator:
 
         return (kept_count, deleted_count)
 
+    def run_phash_pass(self) -> tuple:
+        """Compute missing perceptual hashes and resolve near-duplicates.
+
+        Runs inside one `bulk_session`, which is safe only because
+        `--dedupe-downloads` returns before any watcher process starts.
+        Cross-thread relocation is enabled for the same reason: this is the
+        one context with no concurrent writer.
+
+        Returns:
+            A tuple of (hashed_count, resolved_count).
+        """
+        from . import perceptual
+        from .near_dupe import NearDupeResolver
+
+        if not self.config.phash_enabled:
+            return (0, 0)
+
+        resolver = NearDupeResolver(
+            self.db, self.config.phash_distance, self.config.verbose
+        )
+        hashed = 0
+        resolved = 0
+
+        with self.db.bulk_session() as conn:
+            for root, dirs, files in os.walk(self.downloads_root):
+                dirs[:] = [d for d in dirs if d != 'original']
+                for fn in files:
+                    if fn == '.hashes.txt':
+                        continue
+                    full_path = os.path.join(root, fn)
+                    if not os.path.isfile(full_path):
+                        continue
+
+                    meta = self.db.get_phash(full_path, conn=conn)
+                    if meta is None:
+                        meta = perceptual.extract(full_path)
+                        if meta is None:
+                            continue
+                        self.db.record_phash(full_path, meta, conn=conn)
+                        hashed += 1
+                        if self.config.verbose:
+                            log.info(f'Perceptual hash: {full_path} '
+                                     f'({len(meta.frames)} frames)')
+
+                    moved = resolver.check(full_path, meta,
+                                           allow_foreign_moves=True, conn=conn)
+                    if moved:
+                        resolved += 1
+
+        return (hashed, resolved)
+
     def remove_legacy_files(self) -> None:
         """Remove legacy .hashes.txt files."""
         for root, dirs, files in os.walk(self.downloads_root):
@@ -197,6 +251,14 @@ class Deduplicator:
         kept_count, deleted_count = self.remove_duplicates(md5_map)
 
         log.info(f'Dedupe complete. Kept {kept_count} groups, removed {deleted_count} files')
+
+        # Perceptual pass runs after the MD5 pass on purpose: exact duplicates
+        # are gone by now, so no ffmpeg spawn is wasted on a file about to be
+        # deleted.
+        if self.config.phash_enabled:
+            hashed, resolved = self.run_phash_pass()
+            log.info(f'Perceptual pass complete. Hashed {hashed} new files, '
+                     f'relocated {resolved} near-duplicates')
 
         # Remove legacy files
         self.remove_legacy_files()
