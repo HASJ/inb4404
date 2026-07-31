@@ -36,6 +36,16 @@ def create_config_from_args(args: argparse.Namespace) -> Config:
     if os.path.exists(script_path):
         workpath = os.path.dirname(script_path)
     
+    phash_distance = getattr(args, 'phash_distance', 3)
+    if phash_distance > 3:
+        log.warning(
+            'phash distance %d exceeds the indexed maximum of 3; clamping to 3',
+            phash_distance
+        )
+        phash_distance = 3
+    if phash_distance < 1:
+        phash_distance = 1
+
     return Config(
         workpath=workpath,
         refresh_time=getattr(args, 'refresh_time', 20.0),
@@ -52,6 +62,8 @@ def create_config_from_args(args: argparse.Namespace) -> Config:
         new_dir=getattr(args, 'new_dir', False),
         origin_name=getattr(args, 'origin_name', False),
         dedupe_downloads=getattr(args, 'dedupe_downloads', False),
+        phash_enabled=getattr(args, 'phash', True),
+        phash_distance=phash_distance,
     )
 
 
@@ -170,11 +182,28 @@ def main() -> None:
         action='store_true',
         help='scan downloads directory, keep oldest file per hash and delete duplicate files'
     )
+    parser.add_argument(
+        '--no-phash', dest='phash', action='store_false', default=True,
+        help='disable perceptual-hash near-duplicate detection'
+    )
+    parser.add_argument(
+        '--phash-distance', type=int, default=3,
+        help='maximum Hamming distance for a near-duplicate frame pair (max 3)'
+    )
 
     args = parser.parse_args()
 
     # Create config from arguments
     config = create_config_from_args(args)
+
+    if config.phash_enabled:
+        from .perceptual import ffmpeg_available
+        if not ffmpeg_available():
+            log.warning(
+                'ffmpeg not found on PATH; perceptual-hash '
+                'near-duplicate detection is disabled'
+            )
+            config.phash_enabled = False
 
     # Ensure the SQLite DB exists before starting any workers
     db_path = os.path.join(config.workpath, 'hashes.db')

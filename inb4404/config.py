@@ -40,6 +40,8 @@ class Config:
     new_dir: bool = False
     origin_name: bool = False
     dedupe_downloads: bool = False
+    phash_enabled: bool = True
+    phash_distance: int = 3
 
     def __post_init__(self):
         # If workpath was customized, but db_path is still pointing to the default_workpath hashes.db,
