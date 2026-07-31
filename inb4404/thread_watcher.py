@@ -20,17 +20,19 @@ log = logging.getLogger('inb4404')
 class ThreadWatcher:
     """Monitors a thread and downloads new files as they appear."""
 
-    def __init__(self, thread_url: str, config: Config, workpath: str):
+    def __init__(self, thread_url: str, config: Config, workpath: str, stop_event: Optional[Any] = None):
         """Initialize the ThreadWatcher.
 
         Args:
             thread_url: The URL of the thread to watch.
             config: Configuration settings.
             workpath: Base working directory path.
+            stop_event: Optional threading/multiprocessing Event to signal shutdown.
         """
         self.thread_url = thread_url
         self.config = config
         self.workpath = workpath
+        self.stop_event = stop_event
         self.parser = ThreadParser()
         self.http_client = HTTPClient()
         # Initialize DB with proper path
@@ -57,6 +59,17 @@ class ThreadWatcher:
         self.throttle = config.throttle
 
         log.info(f'Watching {self.board}/{self.thread_id} (Dir: {self.thread_dir_name})')
+
+    def _sleep(self, seconds: float) -> None:
+        """Sleep for the specified number of seconds, or until stop_event is set.
+
+        Args:
+            seconds: Time to sleep in seconds.
+        """
+        if self.stop_event:
+            self.stop_event.wait(seconds)
+        else:
+            time.sleep(seconds)
 
     def _determine_directory_name(self) -> str:
         """Determine the directory name to use for this thread.
@@ -133,10 +146,25 @@ class ThreadWatcher:
                 log.warning(f'Could not stat file: {full_path}: {e}')
                 continue
 
-            # Compute hash
-            file_hash = self.file_manager.compute_hash(full_path)
+            # Check DB metadata cache
+            file_hash = None
+            metadata = self.db.get_file_metadata(full_path)
+            if metadata:
+                db_md5, db_mtime, db_size = metadata
+                if db_mtime == mtime and db_size == size:
+                    file_hash = db_md5
+                    if self.config.verbose:
+                        log.debug(f'Skipping hash for {full_path} (mtime and size match)')
+                else:
+                    if self.config.verbose:
+                        log.info(f'Metadata mismatch for {full_path}. Invalidating DB entry.')
+                    self.db.delete_file_metadata(full_path)
+
             if not file_hash:
-                continue
+                # Compute hash
+                file_hash = self.file_manager.compute_hash(full_path)
+                if not file_hash:
+                    continue
 
             # Check for duplicates
             gpath = self.db.get_path(file_hash)
@@ -355,10 +383,33 @@ class ThreadWatcher:
             count += 1
 
             # Delay between downloads
-            time.sleep(self.throttle)
+            self._sleep(self.throttle)
 
         except (HTTPError, ThreadNotFoundError) as e:
             log.warning(f'Failed to download {link}: {e}')
+        except OSError as e:
+            if e.errno == 22:
+                # Fallback to simple filename if we hit an invalid argument error (e.g. filename too long or bad chars)
+                # Use tim + ext if available (guaranteed safe), otherwise use basename of img
+                link, img, api_md5_hex, api_md5_b64, original_name, tim, ext = (list(enum_tuple) + [None] * 7)[:7]
+                
+                if tim and ext:
+                    fallback_name = str(tim) + ext
+                elif img:
+                    fallback_name = os.path.basename(img)
+                else:
+                    fallback_name = f"fallback_{int(time.time())}"
+
+                fallback_path = os.path.join(self.directory, fallback_name)
+                if self.config.verbose:
+                    log.warning(f'Invalid filename "{os.path.basename(img_path)}", retrying with server name "{fallback_name}"')
+                try:
+                    self._save_file(fallback_path, data, data_hash, total, count)
+                    count += 1
+                except Exception as retry_e:
+                     log.warning(f'Failed to save fallback file {fallback_path}: {retry_e}')
+            else:
+                 log.warning(f'Unexpected error downloading {link}: {e}')
         except Exception as e:
             log.warning(f'Unexpected error downloading {link}: {e}')
 
@@ -419,7 +470,7 @@ class ThreadWatcher:
         self._scan_directory()
 
         # Main polling loop
-        while True:
+        while not (self.stop_event and self.stop_event.is_set()):
             try:
                 # Fetch thread data
                 items, all_titles = self._fetch_thread_data()
@@ -428,6 +479,8 @@ class ThreadWatcher:
 
                 # Process each file entry
                 for enum_index, enum_tuple in enumerate(items):
+                    if self.stop_event and self.stop_event.is_set():
+                        break
                     count = self._process_file_entry(enum_tuple, enum_index, all_titles, total, count)
 
             except ThreadNotFoundError:
@@ -442,12 +495,14 @@ class ThreadWatcher:
                     log.info(f'{self.thread_url} 429\'d')
                     self.throttle += self.config.backoff
                     sleep_time = 10 + self.throttle
-                    time.sleep(sleep_time)
+                    self._sleep(sleep_time)
                     continue
 
                 # Try to reload thread
                 try:
-                    time.sleep(10)
+                    self._sleep(10)
+                    if self.stop_event and self.stop_event.is_set():
+                        break
                     self.http_client.fetch(self.thread_url)
                 except ThreadNotFoundError:
                     # Thread 404'd - exit with code 404
@@ -467,7 +522,7 @@ class ThreadWatcher:
                 raise
 
             # Sleep before next refresh
-            time.sleep(self.config.refresh_time)
+            self._sleep(self.config.refresh_time)
 
             if self.config.verbose:
                 log.info(f'Checking {self.board}/{self.thread_dir_name}')

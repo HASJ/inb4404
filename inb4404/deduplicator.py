@@ -44,6 +44,17 @@ class Deduplicator:
         if self.config.verbose:
             log.info(f'Scanning files in downloads directory: {self.downloads_root}')
 
+        # Pull the whole path->(md5, mtime, size) map up front. Dedupe is a
+        # standalone mode with no watcher processes running, so a single read
+        # is safe here and avoids one SQLite connection per file.
+        known = self.db.load_all_metadata()
+        if self.config.verbose:
+            log.info(f'Loaded metadata for {len(known)} paths from {self.db.db_path}')
+
+        stale_paths: List[str] = []
+        cached = 0
+        hashed = 0
+
         for root, dirs, files in os.walk(self.downloads_root):
             for fn in files:
                 if fn == '.hashes.txt':
@@ -60,11 +71,12 @@ class Deduplicator:
                     log.warning(f'Could not stat file: {full_path}: {e}')
                     continue
 
-                metadata = self.db.get_file_metadata(full_path)
+                metadata = known.get(full_path)
                 if metadata:
                     db_md5, db_mtime, db_size = metadata
                     if db_mtime == mtime and db_size == size:
                         md5_map.setdefault(db_md5, []).append((full_path, mtime, size))
+                        cached += 1
                         if self.config.verbose:
                             log.debug(f'Skipping hash for {full_path} (mtime and size match)')
                         continue
@@ -73,7 +85,7 @@ class Deduplicator:
                         # The DB entry is stale and should be removed to prevent future confusion.
                         if self.config.verbose:
                             log.info(f'Metadata mismatch for {full_path}. invalidating DB entry.')
-                        self.db.delete_file_metadata(full_path)
+                        stale_paths.append(full_path)
 
                 h = self.file_manager.compute_hash(full_path)
                 if not h:
@@ -81,12 +93,21 @@ class Deduplicator:
                     continue
 
                 md5_map.setdefault(h, []).append((full_path, mtime, size))
+                hashed += 1
                 if self.config.verbose:
                     log.info(f'Hashed: {full_path} -> {h}')
-        
-        if self.config.verbose:
-            total_files = sum(len(v) for v in md5_map.values())
-            log.info(f'Found {total_files} files, {len(md5_map)} unique hashes')
+
+        # Drop invalidated rows in one transaction rather than one per file.
+        if stale_paths:
+            self.db.delete_paths(stale_paths)
+            if self.config.verbose:
+                log.info(f'Invalidated {len(stale_paths)} stale DB entries')
+
+        total_files = sum(len(v) for v in md5_map.values())
+        log.info(
+            f'Scanned {total_files} files ({len(md5_map)} unique hashes): '
+            f'{cached} reused from DB, {hashed} hashed from disk'
+        )
 
         return md5_map
 
@@ -100,6 +121,19 @@ class Deduplicator:
         kept_count = 0
         deleted_count = 0
 
+        # One read of the md5->path mapping, one write at the end. Replaces a
+        # get_path() query plus an upsert() commit per hash group.
+        known_paths = self.db.load_all_paths()
+        pending: List[Tuple[str, str, str, int, int]] = []
+
+        def queue_upsert(h: str, kept_path: str, mtime: int, size: int) -> None:
+            """Queue a DB row for the kept file when the mapping is missing or wrong."""
+            if known_paths.get(h) == kept_path:
+                return
+            rel = os.path.relpath(kept_path, self.downloads_root)
+            thread_name = os.path.dirname(rel).replace(os.sep, '/')
+            pending.append((h, kept_path, thread_name, mtime, size))
+
         for h, paths in md5_map.items():
             if len(paths) > 1:
                 # Sort by mtime ascending (oldest first)
@@ -108,15 +142,9 @@ class Deduplicator:
                 duplicates = paths_sorted[1:]
 
                 log.info(f'Found {len(duplicates)} duplicate(s) for hash {h}. Keeping oldest file: {os.path.basename(kept_path)}')
-                
-                # Upsert the kept file's hash into the database only if needed
-                if self.db.get_path(h) != kept_path:
-                    rel = os.path.relpath(kept_path, self.downloads_root)
-                    thread_name = os.path.dirname(rel).replace(os.sep, '/')
-                    self.db.upsert(h, kept_path, thread_name, mtime, size)
-                    
-                    if self.config.verbose:
-                        log.info(f'  Updated database with hash {h} for {kept_path}')
+
+                # Queue the kept file's hash for the database only if needed
+                queue_upsert(h, kept_path, mtime, size)
 
                 for d_path, _, _ in duplicates:
                     try:
@@ -134,19 +162,15 @@ class Deduplicator:
             else:
                 # No duplicates, just ensure hash is in DB
                 kept_path, mtime, size = paths[0]
-
-                # Check if hash mapping is already correct to avoid unnecessary writes
-                if self.db.get_path(h) == kept_path:
-                    kept_count += 1
-                    continue
-
-                rel = os.path.relpath(kept_path, self.downloads_root)
-                thread_name = os.path.dirname(rel).replace(os.sep, '/')
-                self.db.upsert(h, kept_path, thread_name, mtime, size)
-                if self.config.verbose:
-                    log.info(f'Added/updated hash {h} for {os.path.basename(kept_path)} in the database.')
+                queue_upsert(h, kept_path, mtime, size)
                 kept_count += 1
-        
+
+        # Single transaction for every hash that was missing or pointed at a
+        # path that is no longer the one we keep.
+        if pending:
+            self.db.upsert_many(pending)
+            log.info(f'Recorded {len(pending)} hashes in the database')
+
         return (kept_count, deleted_count)
 
     def remove_legacy_files(self) -> None:

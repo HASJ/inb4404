@@ -5,7 +5,7 @@ import hashlib
 from typing import Optional
 
 try:
-    from django.utils.text import get_valid_filename as django_get_valid_filename
+    from django.utils.text import get_valid_filename as django_get_valid_filename  # type: ignore
     HAS_DJANGO = True
 except ImportError:
     HAS_DJANGO = False

@@ -41,3 +41,11 @@ class Config:
     origin_name: bool = False
     dedupe_downloads: bool = False
 
+    def __post_init__(self):
+        # If workpath was customized, but db_path is still pointing to the default_workpath hashes.db,
+        # update it to use the customized workpath.
+        default_db_path = os.path.join(DEFAULT_WORKPATH, DB_PATH_DEFAULT)
+        if self.db_path == default_db_path and self.workpath != DEFAULT_WORKPATH:
+            self.db_path = os.path.join(self.workpath, DB_PATH_DEFAULT)
+
+

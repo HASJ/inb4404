@@ -4,8 +4,9 @@ import time
 import logging
 import sys
 import threading
+import multiprocessing
 from multiprocessing import Process
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, Any
 
 from .config import Config
 from .thread_watcher import ThreadWatcher
@@ -15,7 +16,7 @@ from .exceptions import ThreadNotFoundError
 log = logging.getLogger('inb4404')
 
 
-def _call_watcher(thread_url: str, config: Config, workpath: str) -> None:
+def _call_watcher(thread_url: str, config: Config, workpath: str, stop_event: Optional[Any] = None) -> None:
     """Helper wrapper used when spawning a multiprocessing.Process.
 
     The Process target should be a picklable callable; this thin wrapper lets
@@ -31,6 +32,7 @@ def _call_watcher(thread_url: str, config: Config, workpath: str) -> None:
         thread_url: The URL of the thread to watch.
         config: Configuration settings.
         workpath: Base working directory path.
+        stop_event: Optional multiprocessing Event to signal shutdown.
     """
     try:
         # Configure logging for child process
@@ -51,7 +53,7 @@ def _call_watcher(thread_url: str, config: Config, workpath: str) -> None:
         pass
 
     try:
-        watcher = ThreadWatcher(thread_url, config, workpath)
+        watcher = ThreadWatcher(thread_url, config, workpath, stop_event=stop_event)
         watcher.watch()
     except ValueError as e:
         log.error(f"Error starting watcher for {thread_url}: {e}")
@@ -80,6 +82,7 @@ class ProcessManager:
         self.running_processes: Dict[str, Process] = {}
         self.http_client = HTTPClient()
         self._force_reload = threading.Event()
+        self.stop_event = multiprocessing.Event()
         self._stop_input_thread = False
 
     def load_queue(self) -> Set[str]:
@@ -89,12 +92,14 @@ class ProcessManager:
             A set of valid thread URLs (lines starting with 'http' and not disabled).
         """
         try:
+            desired_links = set()
             with open(self.filename, 'r', encoding='utf-8') as f:
-                # A link is valid if it starts with http and not with a '-'
-                desired_links = {
-                    line.strip() for line in f
-                    if line.strip().startswith('http') and not line.strip().startswith('-http')
-                }
+                for line in f:
+                    # Split line to handle potential multiple URLs (error recovery)
+                    parts = line.strip().split()
+                    for part in parts:
+                        if part.startswith('http') and not part.startswith('-http'):
+                            desired_links.add(part)
             return desired_links
         except FileNotFoundError:
             log.error(f'File not found: {self.filename}')
@@ -114,7 +119,7 @@ class ProcessManager:
         log.info(f'Starting new watcher for {link}')
         process = Process(
             target=_call_watcher,
-            args=(link, self.config, self.workpath)
+            args=(link, self.config, self.workpath, self.stop_event)
         )
         process.start()
         self.running_processes[link] = process
@@ -207,7 +212,7 @@ class ProcessManager:
 
                 new_proc = Process(
                     target=_call_watcher,
-                    args=(link, self.config, self.workpath)
+                    args=(link, self.config, self.workpath, self.stop_event)
                 )
                 new_proc.start()
                 time.sleep(1)  # Give it a moment to start
@@ -277,22 +282,39 @@ class ProcessManager:
         """Background thread to listen for new URLs from stdin."""
         while not self._stop_input_thread:
             try:
+                if sys.platform == 'win32':
+                    import msvcrt
+                    # On Windows, readline() is blocking and can prevent Ctrl+C
+                    # from working if no input is present. We check kbhit() first.
+                    if not msvcrt.kbhit():
+                        time.sleep(0.1)
+                        continue
+
                 line = sys.stdin.readline()
                 if not line:
                     break
                 line = line.strip()
-                if line.startswith('http'):
-                    log.info(f'New URL detected from input: {line}')
+                
+                # Split line into tokens to handle multiple URLs pasted at once
+                tokens = line.split()
+                new_urls = []
+                for token in tokens:
+                    if token.startswith('http'):
+                        new_urls.append(token)
+                    elif token:
+                        log.warning(f'Ignored invalid input token: {token}')
+
+                if new_urls:
+                    log.info(f'New URL(s) detected from input: {", ".join(new_urls)}')
                     # Append to file
                     try:
                         with open(self.filename, 'a', encoding='utf-8') as f:
-                            f.write(f'\n{line}')
+                            for url in new_urls:
+                                f.write(f'\n{url}')
                         # Trigger reload
                         self._force_reload.set()
                     except IOError as e:
-                        log.error(f'Failed to append URL to {self.filename}: {e}')
-                elif line:
-                    log.warning(f'Ignored invalid input: {line}')
+                        log.error(f'Failed to append URL(s) to {self.filename}: {e}')
             except ValueError:
                 # Can happen if stdin is closed
                 break
@@ -402,9 +424,28 @@ class ProcessManager:
         except KeyboardInterrupt:
             self._stop_input_thread = True
             log.info('Ctrl+C detected. Shutting down all watcher processes...')
+            self.stop_event.set()
+            
+            # Wait for processes to exit gracefully
+            start_time = time.time()
+            still_running = []
+            
             for link, process in self.running_processes.items():
-                log.info(f'Terminating watcher for {link}')
-                process.terminate()
-                process.join(timeout=5)
+                process.join(timeout=0.5)
+                if process.is_alive():
+                    still_running.append((link, process))
+            
+            # If any are still running after a quick join attempt, wait a bit longer
+            if still_running:
+                log.info(f'Waiting for {len(still_running)} processes to finish...')
+                for link, process in still_running:
+                    process.join(timeout=5)
+            
+            # Finally, terminate any stubborn processes
+            for link, process in self.running_processes.items():
+                if process.is_alive():
+                    log.warning(f'Process for {link} did not exit gracefully. Terminating.')
+                    process.terminate()
+            
             log.info('All watchers have been shut down.')
 

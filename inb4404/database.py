@@ -2,7 +2,7 @@
 import sqlite3
 import time
 import logging
-from typing import Optional, Set, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 import os
 from contextlib import contextmanager
 
@@ -73,6 +73,7 @@ class HashDB:
                 
                 # Add an index on the path column for faster lookups
                 cur.execute('CREATE INDEX IF NOT EXISTS idx_hashes_path ON hashes(path)')
+
 
                 conn.commit()
         except Exception as e:
@@ -178,6 +179,81 @@ class HashDB:
         except Exception as e:
             log.warning(f'Could not delete from hashes DB: {e}')
 
+    def load_all_metadata(self) -> Dict[str, Tuple[str, int, int]]:
+        """Load metadata for every stored path in a single query.
+
+        Bulk equivalent of calling `get_file_metadata` once per path. Intended
+        for whole-tree passes (e.g. `--dedupe-downloads`) where opening one
+        connection per file dominates the runtime.
+
+        Returns:
+            A dict mapping path -> (md5, mtime, size). Empty on failure.
+        """
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT path, md5, mtime, size FROM hashes')
+                return {
+                    row[0]: (row[1], row[2], row[3])
+                    for row in cur.fetchall() if row and row[0]
+                }
+        except Exception as e:
+            log.warning(f'Could not bulk-load metadata from hashes DB: {e}')
+            return {}
+
+    def load_all_paths(self) -> Dict[str, str]:
+        """Load the md5 -> path mapping for every row in a single query.
+
+        Bulk equivalent of calling `get_path` once per hash.
+
+        Returns:
+            A dict mapping md5 -> path. Empty on failure.
+        """
+        try:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT md5, path FROM hashes')
+                return {row[0]: row[1] for row in cur.fetchall() if row and row[0]}
+        except Exception as e:
+            log.warning(f'Could not bulk-load paths from hashes DB: {e}')
+            return {}
+
+    def upsert_many(self, rows: Sequence[Tuple[str, str, str, int, int]]) -> None:
+        """Insert or replace many md5->path mappings in one transaction.
+
+        Args:
+            rows: Sequence of (md5, path, thread_name, mtime, size) tuples.
+        """
+        if not rows:
+            return
+        ts = int(time.time())
+        try:
+            with self._get_connection() as conn:
+                conn.executemany(
+                    'INSERT OR REPLACE INTO hashes (md5, path, thread, ts, mtime, size) VALUES (?,?,?,?,?,?)',
+                    [(md5, path, thread, ts, mtime, size)
+                     for md5, path, thread, mtime, size in rows]
+                )
+                conn.commit()
+        except Exception as e:
+            log.warning(f'Could not bulk-upsert into hashes DB: {e}')
+
+    def delete_paths(self, paths: Iterable[str]) -> None:
+        """Delete metadata for many file paths in one transaction.
+
+        Args:
+            paths: The file paths to remove from the database.
+        """
+        rows = [(p,) for p in paths]
+        if not rows:
+            return
+        try:
+            with self._get_connection() as conn:
+                conn.executemany('DELETE FROM hashes WHERE path=?', rows)
+                conn.commit()
+        except Exception as e:
+            log.warning(f'Could not bulk-delete from hashes DB: {e}')
+
     def get_thread_hashes(self, thread_id: str) -> Set[str]:
         """Get all MD5 hashes for a specific thread.
 
@@ -210,4 +286,3 @@ class HashDB:
                 return row[0] if row else 0
         except Exception:
             return 0
-

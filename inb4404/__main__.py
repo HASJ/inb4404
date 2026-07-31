@@ -199,8 +199,8 @@ def main() -> None:
     # Check for optional dependencies if --title is used
     if config.title:
         try:
-            import bs4  # noqa: F401
-            import django  # noqa: F401
+            import bs4  # type: ignore # noqa: F401
+            import django  # type: ignore # noqa: F401
         except ImportError:
             log.error('Could not import the required modules! Disabling --title option...')
             config.title = False
