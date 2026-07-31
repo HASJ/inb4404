@@ -11,6 +11,9 @@ from .file_utils import FileManager
 
 log = logging.getLogger('inb4404')
 
+# Hosts a thread URL may point at: the apex domain, or any subdomain of it.
+ALLOWED_DOMAINS = ('4chan.org', '4channel.org')
+
 
 @dataclass
 class ThreadURL:
@@ -38,9 +41,13 @@ class ThreadURL:
         if not parsed_url.netloc:
             raise ValueError(f"Invalid URL format: {url}")
 
-        # Validate domain (should end with 4chan.org or 4channel.org)
-        hostname = parsed_url.hostname or ''
-        if not (hostname.endswith('4chan.org') or hostname.endswith('4channel.org')):
+        # Validate domain. A bare endswith() check is not enough: 'not4chan.org'
+        # ends with '4chan.org', so any attacker-registered lookalike domain
+        # would pass. Require either the apex domain itself or a dot-delimited
+        # subdomain of it.
+        hostname = (parsed_url.hostname or '').lower().rstrip('.')
+        if not any(hostname == d or hostname.endswith('.' + d)
+                   for d in ALLOWED_DOMAINS):
             raise ValueError(f"Unsupported domain: {hostname}. Only 4chan.org and 4channel.org are supported.")
 
         # Clean path and split
