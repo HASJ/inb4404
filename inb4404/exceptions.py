@@ -28,3 +28,11 @@ class HTTPError(Inb4404Error):
     def __init__(self, message: str, code: Optional[int] = None):
         super().__init__(message)
         self.code = code
+
+
+class MaintenanceError(HTTPError):
+    """Raised when the server is in maintenance mode."""
+
+    def __init__(self, message: str = "Performing maintenance. We'll be back soon.", code: Optional[int] = None):
+        super().__init__(message, code=code)
+

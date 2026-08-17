@@ -7,12 +7,12 @@ import logging
 import hashlib
 from typing import List, Tuple, Optional, Set, Dict, Any
 
-from .config import Config
+from .config import Config, EXITCODE_MAINTENANCE
 from .database import HashDB
 from .http_client import HTTPClient
 from .file_utils import FileManager
 from .thread_parser import ThreadParser, ThreadURL
-from .exceptions import ThreadNotFoundError, HTTPError
+from .exceptions import ThreadNotFoundError, HTTPError, MaintenanceError
 
 log = logging.getLogger('inb4404')
 
@@ -20,7 +20,14 @@ log = logging.getLogger('inb4404')
 class ThreadWatcher:
     """Monitors a thread and downloads new files as they appear."""
 
-    def __init__(self, thread_url: str, config: Config, workpath: str, stop_event: Optional[Any] = None):
+    def __init__(
+        self,
+        thread_url: str,
+        config: Config,
+        workpath: str,
+        stop_event: Optional[Any] = None,
+        raise_on_maintenance: bool = False,
+    ):
         """Initialize the ThreadWatcher.
 
         Args:
@@ -28,11 +35,13 @@ class ThreadWatcher:
             config: Configuration settings.
             workpath: Base working directory path.
             stop_event: Optional threading/multiprocessing Event to signal shutdown.
+            raise_on_maintenance: If True, raise SystemExit(EXITCODE_MAINTENANCE) on maintenance.
         """
         self.thread_url = thread_url
         self.config = config
         self.workpath = workpath
         self.stop_event = stop_event
+        self.raise_on_maintenance = raise_on_maintenance
         self.http_client = HTTPClient(stop_event=self.stop_event)
         self.parser = ThreadParser(http_client=self.http_client)
         # Initialize DB with proper path
@@ -227,6 +236,8 @@ class ThreadWatcher:
                             p.get('filename'), tim, ext
                         ))
                 return (sorted(file_entries, key=lambda t: t[1]), all_titles)
+        except (ThreadNotFoundError, MaintenanceError):
+            raise
         except Exception:
             pass
 
@@ -241,7 +252,7 @@ class ThreadWatcher:
                 all_titles = self.parser.extract_titles(html_result)
 
             return (items, all_titles)
-        except (ThreadNotFoundError, HTTPError):
+        except (ThreadNotFoundError, MaintenanceError, HTTPError):
             raise
         except Exception as e:
             log.warning(f'Failed to fetch thread data: {e}')
@@ -399,6 +410,8 @@ class ThreadWatcher:
             # Delay between downloads
             self._sleep(self.throttle)
 
+        except MaintenanceError:
+            raise
         except (HTTPError, ThreadNotFoundError) as e:
             log.warning(f'Failed to download {link}: {e}')
         except OSError as e:
@@ -507,6 +520,8 @@ class ThreadWatcher:
         # Scan directory for existing files
         self._scan_directory()
 
+        maintenance_attempts = 0
+
         # Main polling loop
         while not (self.stop_event and self.stop_event.is_set()):
             try:
@@ -520,6 +535,32 @@ class ThreadWatcher:
                     if self.stop_event and self.stop_event.is_set():
                         break
                     count = self._process_file_entry(enum_tuple, enum_index, all_titles, total, count)
+
+                if maintenance_attempts > 0:
+                    log.info(
+                        f'Server maintenance is over for {self.board}/{self.thread_dir_name}. '
+                        f'Resuming normal operations.'
+                    )
+                    maintenance_attempts = 0
+
+            except MaintenanceError as e:
+                if self.raise_on_maintenance:
+                    log.warning(f"Server maintenance detected for {self.thread_url}: {e}")
+                    import sys
+                    raise SystemExit(EXITCODE_MAINTENANCE)
+
+                maintenance_attempts += 1
+                wait_seconds = min(
+                    self.config.maintenance_initial_wait + (maintenance_attempts - 1) * self.config.maintenance_wait_increment,
+                    self.config.maintenance_max_wait
+                )
+                wait_minutes = wait_seconds / 60.0
+                log.warning(
+                    f"Server is in maintenance mode ({self.thread_url}). "
+                    f"Waiting {wait_minutes:.1f} minutes before retry (attempt {maintenance_attempts})."
+                )
+                self._sleep(wait_seconds)
+                continue
 
             except ThreadNotFoundError:
                 # Thread 404'd - exit with code 404
@@ -545,8 +586,12 @@ class ThreadWatcher:
                 self._sleep(10)
                 continue
 
+            if self.stop_event and self.stop_event.is_set():
+                break
+
             # Sleep before next refresh
             self._sleep(self.config.refresh_time)
+
 
             if self.config.verbose:
                 log.info(f'Checking {self.board}/{self.thread_dir_name}')

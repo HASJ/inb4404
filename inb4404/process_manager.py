@@ -8,11 +8,11 @@ import multiprocessing
 from multiprocessing import Process
 from typing import Dict, Set, Optional, Any
 
-from .config import Config
+from .config import Config, EXITCODE_MAINTENANCE
 from .thread_watcher import ThreadWatcher
 from .thread_parser import ThreadURL
-from .http_client import HTTPClient
-from .exceptions import ThreadNotFoundError
+from .http_client import HTTPClient, is_maintenance_message
+from .exceptions import ThreadNotFoundError, MaintenanceError, HTTPError
 
 log = logging.getLogger('inb4404')
 
@@ -54,15 +54,20 @@ def _call_watcher(thread_url: str, config: Config, workpath: str, stop_event: Op
         pass
 
     try:
-        watcher = ThreadWatcher(thread_url, config, workpath, stop_event=stop_event)
+        watcher = ThreadWatcher(
+            thread_url, config, workpath, stop_event=stop_event, raise_on_maintenance=True
+        )
         watcher.watch()
     except ValueError as e:
         log.error(f"Error starting watcher for {thread_url}: {e}")
         raise SystemExit(1)
+    except MaintenanceError as e:
+        log.warning(f"Server maintenance detected for {thread_url}: {e}")
+        raise SystemExit(EXITCODE_MAINTENANCE)
     except KeyboardInterrupt:
         pass
     except SystemExit:
-        # Re-raise SystemExit to preserve exit code (e.g., 404)
+        # Re-raise SystemExit to preserve exit code (e.g., 404, 503)
         raise
 
 
@@ -172,6 +177,84 @@ class ProcessManager:
         # Windows: 404; POSIX (Linux/macOS): 404 % 256 = 148
         return exitcode in (404, 404 % 256)
 
+    def _is_exitcode_maintenance(self, exitcode: Optional[int]) -> bool:
+        """Check if an exit code indicates server maintenance (handling POSIX 8-bit wrap)."""
+        if exitcode is None:
+            return False
+        # Windows: 503 / 429; POSIX: 503 % 256 = 247, 429 % 256 = 173
+        return exitcode in (EXITCODE_MAINTENANCE, EXITCODE_MAINTENANCE % 256, 429, 429 % 256)
+
+    def _handle_maintenance_mode(self, probe_link: str) -> None:
+        """Handle server maintenance by stopping all watchers and monitoring with a single probe.
+
+        Args:
+            probe_link: The URL to probe for checking if maintenance has ended.
+        """
+        log.warning(
+            "Server is performing maintenance ('Performing maintenance. We'll be back soon.'). "
+            "Stopping all other watchers..."
+        )
+
+        # Stop all running watcher processes
+        for link, process in list(self.running_processes.items()):
+            try:
+                process.terminate()
+                process.join(timeout=2)
+            except Exception:
+                pass
+        self.running_processes.clear()
+
+        attempt = 0
+        while not (self.stop_event and self.stop_event.is_set()):
+            attempt += 1
+            wait_seconds = min(
+                self.config.maintenance_initial_wait + (attempt - 1) * self.config.maintenance_wait_increment,
+                self.config.maintenance_max_wait
+            )
+            wait_minutes = wait_seconds / 60.0
+            log.warning(
+                f"Maintenance in progress. Single watcher checking {probe_link} in {wait_minutes:.1f} minutes "
+                f"(attempt {attempt})..."
+            )
+
+            # Wait with periodic check of stop_event
+            start_wait = time.time()
+            while time.time() - start_wait < wait_seconds:
+                if self.stop_event and self.stop_event.is_set():
+                    return
+                time.sleep(1)
+
+            if self.stop_event and self.stop_event.is_set():
+                return
+
+            log.info(f"Checking if maintenance is over (attempt {attempt})...")
+            is_still_maintenance = False
+            try:
+                parsed = ThreadURL.parse(probe_link)
+                # Try fetching thread API or canonical URL
+                api_res = self.http_client.fetch_thread_api(parsed.board, parsed.thread_id)
+                if api_res is None:
+                    self.http_client.fetch(parsed.canonical_url)
+            except MaintenanceError:
+                is_still_maintenance = True
+            except HTTPError as e:
+                if hasattr(e, 'code') and e.code == 429:
+                    is_still_maintenance = True
+                elif is_maintenance_message(str(e)):
+                    is_still_maintenance = True
+            except ThreadNotFoundError:
+                # 404 means the server is back online and responding normally!
+                is_still_maintenance = False
+            except Exception as e:
+                if is_maintenance_message(str(e)):
+                    is_still_maintenance = True
+
+            if not is_still_maintenance:
+                log.info("Server maintenance is over! Resuming all watchers.")
+                break
+            else:
+                log.warning("Server is still in maintenance: Performing maintenance. We'll be back soon.")
+
     def _handle_dead_process(self, link: str, max_restarts: int) -> bool:
         """Handle a dead process - check exit code, probe, and restart if needed.
 
@@ -190,14 +273,22 @@ class ProcessManager:
             except Exception:
                 pass
 
+        # If exit code indicates maintenance, enter maintenance mode
+        if self._is_exitcode_maintenance(exitcode):
+            log.warning(f"Watcher for {link} exited due to server maintenance.")
+            self.running_processes.pop(link, None)
+            self._handle_maintenance_mode(link)
+            return False
+
         # If exit code is 404, immediately disable
         if self._is_exitcode_404(exitcode):
             self._disable_link(link, reason='404')
             self.running_processes.pop(link, None)
             return True
 
-        # Quick probe: try to load the thread page/API to detect 404s
+        # Quick probe: try to load the thread page/API to detect 404s or maintenance
         is_404 = False
+        is_maintenance = False
         try:
             parsed = ThreadURL.parse(link)
             # Try 4chan JSON API first
@@ -210,18 +301,30 @@ class ProcessManager:
                     self.http_client.fetch(parsed.canonical_url)
                 except ThreadNotFoundError:
                     is_404 = True
+                except MaintenanceError:
+                    is_maintenance = True
                 except Exception:
                     pass
+        except MaintenanceError:
+            is_maintenance = True
         except ThreadNotFoundError:
             is_404 = True
         except Exception:
             # Fallback probe with raw link
             try:
                 self.http_client.fetch(link)
+            except MaintenanceError:
+                is_maintenance = True
             except ThreadNotFoundError:
                 is_404 = True
             except Exception:
                 pass
+
+        if is_maintenance:
+            log.warning(f"Server maintenance detected during probe for {link}.")
+            self.running_processes.pop(link, None)
+            self._handle_maintenance_mode(link)
+            return False
 
         if is_404:
             self._disable_link(link, reason='404')

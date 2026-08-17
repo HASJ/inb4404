@@ -64,7 +64,11 @@ def create_config_from_args(args: argparse.Namespace) -> Config:
         dedupe_downloads=getattr(args, 'dedupe_downloads', False),
         phash_enabled=getattr(args, 'phash', True),
         phash_distance=phash_distance,
+        maintenance_initial_wait=getattr(args, 'maintenance_initial_wait', 1800.0),
+        maintenance_wait_increment=getattr(args, 'maintenance_wait_increment', 1800.0),
+        maintenance_max_wait=getattr(args, 'maintenance_max_wait', 7200.0),
     )
+
 
 
 def setup_logging(config: Config) -> None:

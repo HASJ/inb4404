@@ -18,6 +18,10 @@ DEFAULT_RELOAD_TIME = 5.0  # minutes
 DEFAULT_THROTTLE = 0.5  # seconds
 DEFAULT_BACKOFF = 0.5  # seconds
 DB_TIMEOUT = 30  # seconds
+DEFAULT_MAINTENANCE_INITIAL_WAIT = 1800.0  # seconds (30 minutes)
+DEFAULT_MAINTENANCE_WAIT_INCREMENT = 1800.0  # seconds (30 minutes)
+DEFAULT_MAINTENANCE_MAX_WAIT = 7200.0  # seconds (120 minutes)
+EXITCODE_MAINTENANCE = 503
 
 
 @dataclass
@@ -42,6 +46,9 @@ class Config:
     dedupe_downloads: bool = False
     phash_enabled: bool = True
     phash_distance: int = 3
+    maintenance_initial_wait: float = DEFAULT_MAINTENANCE_INITIAL_WAIT
+    maintenance_wait_increment: float = DEFAULT_MAINTENANCE_WAIT_INCREMENT
+    maintenance_max_wait: float = DEFAULT_MAINTENANCE_MAX_WAIT
 
     def __post_init__(self):
         # If workpath was customized, but db_path is still pointing to the default_workpath hashes.db,

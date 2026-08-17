@@ -7,9 +7,44 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
-from .exceptions import HTTPError, ThreadNotFoundError
+from .exceptions import HTTPError, ThreadNotFoundError, MaintenanceError
 
 log = logging.getLogger('inb4404')
+
+MAINTENANCE_MESSAGE = "Performing maintenance. We'll be back soon."
+
+
+def is_maintenance_message(content: Any) -> bool:
+    """Check if content contains the maintenance message.
+
+    Args:
+        content: The response data or error string to check (bytes, str, Exception, etc.).
+
+    Returns:
+        True if maintenance message is detected, False otherwise.
+    """
+    if content is None:
+        return False
+    if isinstance(content, bytes):
+        try:
+            text = content.decode('utf-8', errors='ignore')
+        except Exception:
+            return False
+    elif isinstance(content, str):
+        text = content
+    else:
+        text = str(content)
+
+    normalized = text.lower()
+    if "performing maintenance. we'll be back soon." in normalized:
+        return True
+    if "performing maintenance. we&#039;ll be back soon." in normalized:
+        return True
+    if "performing maintenance. we&apos;ll be back soon." in normalized:
+        return True
+    if "performing maintenance" in normalized and "back soon" in normalized:
+        return True
+    return False
 
 
 class HTTPClient:
@@ -93,6 +128,7 @@ class HTTPClient:
             The raw content of the response.
 
         Raises:
+            MaintenanceError: If the server is in maintenance mode.
             HTTPError: If the request fails after all retries.
             ThreadNotFoundError: If the response is 404 (not retried).
         """
@@ -120,8 +156,28 @@ class HTTPClient:
 
             try:
                 response = urllib.request.urlopen(req, timeout=timeout)
-                return response.read()
+                data = response.read()
+                if is_maintenance_message(data):
+                    raise MaintenanceError(
+                        f"Server in maintenance: {MAINTENANCE_MESSAGE}",
+                        code=getattr(response, 'status', 200)
+                    )
+                return data
+            except MaintenanceError:
+                raise
             except urllib.error.HTTPError as e:
+                try:
+                    body = e.read() if hasattr(e, 'read') else b''
+                    if is_maintenance_message(body):
+                        raise MaintenanceError(
+                            f"Server in maintenance: {MAINTENANCE_MESSAGE}",
+                            code=e.code
+                        ) from e
+                except MaintenanceError:
+                    raise
+                except Exception:
+                    pass
+
                 if e.code == 404:
                     raise ThreadNotFoundError(f'Thread not found: {url}') from e
                 last_error = e
@@ -219,8 +275,27 @@ class HTTPClient:
             try:
                 response = urllib.request.urlopen(req, timeout=timeout)
                 data = response.read().decode('utf-8')
+                if is_maintenance_message(data):
+                    raise MaintenanceError(
+                        f"Server in maintenance: {MAINTENANCE_MESSAGE}",
+                        code=getattr(response, 'status', 200)
+                    )
                 return json.loads(data)
+            except MaintenanceError:
+                raise
             except urllib.error.HTTPError as e:
+                try:
+                    body = e.read() if hasattr(e, 'read') else b''
+                    if is_maintenance_message(body):
+                        raise MaintenanceError(
+                            f"Server in maintenance: {MAINTENANCE_MESSAGE}",
+                            code=e.code
+                        ) from e
+                except MaintenanceError:
+                    raise
+                except Exception:
+                    pass
+
                 if e.code == 404:
                     raise ThreadNotFoundError(f'Thread not found: {board}/{thread_id}') from e
                 log.debug(f"HTTP error {e.code} fetching thread API for {board}/{thread_id}: {e}")
