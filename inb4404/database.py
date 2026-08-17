@@ -444,44 +444,6 @@ class HashDB:
             log.warning('Could not probe phash candidates: %s', e)
         return found
 
-    def move_phash_path(self, old_path, new_path, conn=None) -> None:
-        """Repoint stored frame rows after a file is relocated.
-
-        Args:
-            old_path: The path the rows currently carry.
-            new_path: The path the file now lives at.
-            conn: Optional open connection from `bulk_session`.
-        """
-        try:
-            with self._session(conn) as c:
-                c.execute('DELETE FROM phash_frames WHERE path=?', (new_path,))
-                c.execute('UPDATE phash_frames SET path=? WHERE path=?',
-                          (new_path, old_path))
-        except Exception as e:
-            log.warning('Could not move phash rows %s -> %s: %s',
-                        old_path, new_path, e)
-
-    def move_hash_path(self, old_path, new_path, conn=None) -> None:
-        """Repoint the md5 row after a file is relocated.
-
-        Keeps the `hashes` table agreeing with `phash_frames` about where a
-        file lives. Without this the md5 row keeps naming the pre-move path,
-        and nothing reconciles it because the directory walks skip
-        `original/`.
-
-        Args:
-            old_path: The path the row currently carries.
-            new_path: The path the file now lives at.
-            conn: Optional open connection from `bulk_session`.
-        """
-        try:
-            with self._session(conn) as c:
-                c.execute('UPDATE hashes SET path=? WHERE path=?',
-                          (new_path, old_path))
-        except Exception as e:
-            log.warning('Could not move hash row %s -> %s: %s',
-                        old_path, new_path, e)
-
     def delete_phash(self, path, conn=None) -> None:
         """Remove all frame rows for `path`."""
         try:
@@ -489,4 +451,26 @@ class HashDB:
                 c.execute('DELETE FROM phash_frames WHERE path=?', (path,))
         except Exception as e:
             log.warning('Could not delete phash rows for %s: %s', path, e)
+
+    def move_phash_path(self, old_path: str, new_path: str, conn=None) -> None:
+        """Update the path stored for all frame rows of a file.
+
+        Args:
+            old_path: Absolute path to the file before relocation.
+            new_path: Absolute path to the file after relocation.
+            conn: Optional open connection from `bulk_session`.
+        """
+        try:
+            with self._session(conn) as c:
+                c.execute('UPDATE phash_frames SET path=? WHERE path=?', (new_path, old_path))
+        except Exception as e:
+            log.warning('Could not move phash path from %s to %s: %s', old_path, new_path, e)
+
+    def delete_hash(self, path, conn=None) -> None:
+        """Remove the md5 row for `path`."""
+        try:
+            with self._session(conn) as c:
+                c.execute('DELETE FROM hashes WHERE path=?', (path,))
+        except Exception as e:
+            log.warning('Could not delete hash row for %s: %s', path, e)
 

@@ -1,76 +1,16 @@
-"""Near-duplicate detection and non-destructive resolution.
+"""Near-duplicate detection and resolution.
 
 Shared by the live watcher and the ``--dedupe-downloads`` pass so the win
-rule and the relocation behaviour exist in exactly one place.
+rule and the deletion behaviour exist in exactly one place.
 """
 import logging
 import os
-import shutil
-from typing import Optional
 
 from . import perceptual
 
 log = logging.getLogger('inb4404')
 
-# Folder that superseded media is moved into, created beside the file it
-# relates to so a resolved pair stays adjacent when browsing.
 ORIGINAL_DIR = 'original'
-
-
-def is_set_aside(path: str) -> bool:
-    """Report whether a path already lives inside an `original/` folder.
-
-    Files there were resolved on an earlier run. Both the directory walks and
-    the candidate scan skip them, so a repeated pass is idempotent.
-
-    Args:
-        path: Path to test.
-
-    Returns:
-        True when any component of the path is the `original/` folder.
-    """
-    parts = os.path.normpath(path).split(os.sep)
-    return ORIGINAL_DIR in parts
-
-
-def relocate(path: str) -> Optional[str]:
-    """Move a file into a sibling `original/` folder, suffixing its stem.
-
-    Picks the smallest free suffix -- `_1`, `_2`, ... -- so repeated
-    resolutions never collide and nothing is overwritten.
-
-    Args:
-        path: Absolute path to the file to move.
-
-    Returns:
-        The new absolute path, or None when the move failed.
-    """
-    if not os.path.isfile(path):
-        return None
-
-    directory = os.path.dirname(path)
-    stem, ext = os.path.splitext(os.path.basename(path))
-    target_dir = os.path.join(directory, ORIGINAL_DIR)
-
-    try:
-        os.makedirs(target_dir, exist_ok=True)
-    except OSError as e:
-        log.warning('Could not create %s: %s', target_dir, e)
-        return None
-
-    index = 1
-    while True:
-        candidate = os.path.join(target_dir, '%s_%d%s' % (stem, index, ext))
-        if not os.path.exists(candidate):
-            break
-        index += 1
-
-    try:
-        shutil.move(path, candidate)
-    except Exception as e:
-        log.warning('Could not move %s to %s: %s', path, candidate, e)
-        return None
-    return candidate
 
 
 class NearDupeResolver(object):
@@ -87,41 +27,43 @@ class NearDupeResolver(object):
         self.db = db
         self.distance = distance
         self.verbose = verbose
-        # Total files moved aside. Counted here rather than inferred from
-        # check()'s return value, which only reports the incoming file being
-        # relocated -- a winning file can displace several held copies in one
-        # call and those would go uncounted.
-        self.relocated = 0
+        # Total files deleted. Counted here rather than inferred from
+        # check()'s return value, which only reports whether the incoming
+        # file was deleted -- a winning file can delete several held copies
+        # in one call and those would go uncounted.
+        self.deleted = 0
 
-    def _set_aside(self, path: str, conn=None) -> Optional[str]:
-        """Relocate one file and repoint both tables at its new path.
+    def _discard(self, path: str, conn=None) -> bool:
+        """Delete one file and drop its rows from both tables.
 
         Args:
-            path: Absolute path to the file to move.
+            path: Absolute path to the file to delete.
             conn: Optional open connection from `HashDB.bulk_session`.
 
         Returns:
-            The new path, or None when the move failed.
+            True when the file was removed.
         """
-        moved = relocate(path)
-        if not moved:
-            return None
-        self.db.move_phash_path(path, moved, conn=conn)
-        self.db.move_hash_path(path, moved, conn=conn)
-        self.relocated += 1
-        return moved
+        try:
+            os.remove(path)
+        except OSError as e:
+            log.warning('Could not delete %s: %s', path, e)
+            return False
+        self.db.delete_phash(path, conn=conn)
+        self.db.delete_hash(path, conn=conn)
+        self.deleted += 1
+        return True
 
     def check(self, path, meta, allow_foreign_moves: bool = False,
-              conn=None) -> Optional[str]:
+              conn=None) -> bool:
         """Compare one file against everything already hashed and resolve.
 
-        The loser of a pair is moved into `original/`; nothing is deleted.
-        When the incoming file loses it is relocated and its new path is
-        returned, so the caller knows the file is no longer where it was
-        written.
+        The loser of a pair is deleted outright. There is no way to verify a
+        held file is still the winner later -- it may be deleted, moved, or
+        renamed by the user -- so keeping a "loser" copy around as a hedge
+        just accumulates disk with no way to know if it is still needed.
 
         A held file in a *different* thread directory may be owned by
-        another watcher process, and moving it mid-download is a race.
+        another watcher process, and deleting it mid-download is a race.
         `allow_foreign_moves` is therefore False during live watching and
         True only in `--dedupe-downloads`, which runs single-process.
 
@@ -129,22 +71,17 @@ class NearDupeResolver(object):
             path: Absolute path to the file being checked.
             meta: Its `perceptual.MediaMeta`.
             allow_foreign_moves: Whether files outside `path`'s directory
-                may be relocated.
+                may be deleted.
             conn: Optional open connection from `HashDB.bulk_session`.
 
         Returns:
-            The incoming file's new path when it was relocated, else None.
+            True when the incoming file was deleted.
         """
         frame_chunks = [perceptual.chunks(h) for h in meta.frames]
         candidates = self.db.find_phash_candidates(
             frame_chunks, exclude_path=path, conn=conn)
 
         for other_path in candidates:
-            if is_set_aside(other_path):
-                # Already resolved on an earlier run. Comparing against it
-                # again would relocate it a second time, nesting original/
-                # inside original/ and making the pass non-idempotent.
-                continue
             other = self.db.get_phash(other_path, conn=conn)
             if other is None:
                 continue
@@ -167,21 +104,20 @@ class NearDupeResolver(object):
                         os.path.basename(path), other_path
                     )
                     continue
-                moved = self._set_aside(other_path, conn=conn)
-                if moved:
-                    log.info('Near-dupe: %s supersedes %s -> %s',
+                if self._discard(other_path, conn=conn):
+                    log.info('Near-dupe: %s supersedes %s -> deleted',
                              os.path.basename(path),
-                             os.path.basename(other_path), moved)
+                             os.path.basename(other_path))
                 # Keep scanning: this file may beat several held copies, and
                 # resolving only the first would leave the rest for a later
                 # run, making the pass non-idempotent.
                 continue
 
-            moved = self._set_aside(path, conn=conn)
-            if moved:
-                log.info('Near-dupe: %s superseded by %s -> %s',
+            deleted = self._discard(path, conn=conn)
+            if deleted:
+                log.info('Near-dupe: %s superseded by %s -> deleted',
                          os.path.basename(path),
-                         os.path.basename(other_path), moved)
-            return moved
+                         os.path.basename(other_path))
+            return deleted
 
-        return None
+        return False

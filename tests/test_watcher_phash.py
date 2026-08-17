@@ -78,7 +78,7 @@ class TestPhashNewFile(unittest.TestCase):
         self.assertGreater(stored.width, 0)
 
     def test_relocates_a_lower_resolution_repost(self):
-        """The end-to-end live path: held file wins, incoming is set aside."""
+        """The end-to-end live path: held file wins, incoming is discarded."""
         src = _sample_media()
         if not src:
             self.skipTest('no media in downloads/ to hash')
@@ -95,11 +95,8 @@ class TestPhashNewFile(unittest.TestCase):
         ThreadWatcher._phash_new_file(self.stub, incoming)
 
         # Identical resolution means the incoming file cannot supersede, so it
-        # is the one moved aside.
+        # is deleted.
         self.assertFalse(os.path.exists(incoming))
-        self.assertTrue(os.path.isfile(
-            os.path.join(self.tmp, ORIGINAL_DIR,
-                         'incoming_1' + os.path.splitext(src)[1])))
         self.assertTrue(os.path.isfile(held))
 
 

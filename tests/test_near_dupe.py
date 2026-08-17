@@ -1,4 +1,4 @@
-"""Tests for near-duplicate resolution and relocation."""
+"""Tests for near-duplicate detection and deletion."""
 import os
 import shutil
 import tempfile
@@ -6,43 +6,12 @@ import unittest
 
 from inb4404 import perceptual
 from inb4404.database import HashDB
-from inb4404.near_dupe import ORIGINAL_DIR, NearDupeResolver, relocate
+from inb4404.near_dupe import NearDupeResolver
 
 
 def meta(frames, width=100, height=100, duration=1.0):
     return perceptual.MediaMeta(frames=frames, width=width, height=height,
                                 duration=duration)
-
-
-class TestRelocate(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _touch(self, name):
-        p = os.path.join(self.tmp, name)
-        with open(p, 'wb') as fh:
-            fh.write(b'x')
-        return p
-
-    def test_moves_into_original_with_suffix(self):
-        src = self._touch('clip.webm')
-        dest = relocate(src)
-        self.assertEqual(
-            dest, os.path.join(self.tmp, ORIGINAL_DIR, 'clip_1.webm'))
-        self.assertTrue(os.path.isfile(dest))
-        self.assertFalse(os.path.exists(src))
-
-    def test_increments_suffix_on_collision(self):
-        relocate(self._touch('clip.webm'))
-        dest = relocate(self._touch('clip.webm'))
-        self.assertEqual(
-            dest, os.path.join(self.tmp, ORIGINAL_DIR, 'clip_2.webm'))
-
-    def test_missing_file_returns_none(self):
-        self.assertIsNone(relocate(os.path.join(self.tmp, 'gone.webm')))
 
 
 class TestResolver(unittest.TestCase):
@@ -64,54 +33,50 @@ class TestResolver(unittest.TestCase):
             fh.write(b'x')
         return p
 
-    def test_no_candidates_returns_none(self):
+    def test_no_candidates_returns_false(self):
         p = self._make(self.thread, 'new.webm')
-        self.assertIsNone(self.resolver.check(p, meta([0x1234])))
+        self.assertFalse(self.resolver.check(p, meta([0x1234])))
 
-    def test_incoming_loser_is_relocated(self):
+    def test_incoming_loser_is_deleted(self):
         held = self._make(self.thread, 'held.webm')
         self.db.record_phash(held, meta([0x1234], width=1920, height=1080))
         new = self._make(self.thread, 'new.webm')
-        moved = self.resolver.check(new, meta([0x1234], width=640, height=480))
-        self.assertEqual(
-            moved, os.path.join(self.thread, ORIGINAL_DIR, 'new_1.webm'))
+        deleted = self.resolver.check(new, meta([0x1234], width=640, height=480))
+        self.assertTrue(deleted)
         self.assertTrue(os.path.isfile(held))
         self.assertFalse(os.path.exists(new))
 
-    def test_incoming_winner_relocates_held_file(self):
+    def test_incoming_winner_deletes_held_file(self):
         held = self._make(self.thread, 'held.webm')
         self.db.record_phash(held, meta([0x1234], width=640, height=480))
         new = self._make(self.thread, 'new.webm')
-        moved = self.resolver.check(new, meta([0x1234], width=1920, height=1080))
-        self.assertIsNone(moved)
+        deleted = self.resolver.check(new, meta([0x1234], width=1920, height=1080))
+        self.assertFalse(deleted)
         self.assertTrue(os.path.isfile(new))
         self.assertFalse(os.path.exists(held))
-        self.assertTrue(os.path.isfile(
-            os.path.join(self.thread, ORIGINAL_DIR, 'held_1.webm')))
 
-    def test_cross_thread_winner_moves_nothing_without_permission(self):
+    def test_cross_thread_winner_deletes_nothing_without_permission(self):
         other = os.path.join(self.tmp, 'downloads', 'g', '9999')
         held = self._make(other, 'held.webm')
         self.db.record_phash(held, meta([0x1234], width=640, height=480))
         new = self._make(self.thread, 'new.webm')
-        moved = self.resolver.check(new, meta([0x1234], width=1920, height=1080),
-                                    allow_foreign_moves=False)
-        self.assertIsNone(moved)
+        deleted = self.resolver.check(new, meta([0x1234], width=1920, height=1080),
+                                      allow_foreign_moves=False)
+        self.assertFalse(deleted)
         self.assertTrue(os.path.isfile(held))
         self.assertTrue(os.path.isfile(new))
 
-    def test_cross_thread_loser_moves_itself(self):
+    def test_cross_thread_loser_deletes_itself(self):
         other = os.path.join(self.tmp, 'downloads', 'g', '9999')
         held = self._make(other, 'held.webm')
         self.db.record_phash(held, meta([0x1234], width=1920, height=1080))
         new = self._make(self.thread, 'new.webm')
-        moved = self.resolver.check(new, meta([0x1234], width=640, height=480),
-                                    allow_foreign_moves=False)
-        self.assertEqual(
-            moved, os.path.join(self.thread, ORIGINAL_DIR, 'new_1.webm'))
+        deleted = self.resolver.check(new, meta([0x1234], width=640, height=480),
+                                      allow_foreign_moves=False)
+        self.assertTrue(deleted)
         self.assertTrue(os.path.isfile(held))
 
-    def test_cross_thread_winner_moves_held_when_permitted(self):
+    def test_cross_thread_winner_deletes_held_when_permitted(self):
         other = os.path.join(self.tmp, 'downloads', 'g', '9999')
         held = self._make(other, 'held.webm')
         self.db.record_phash(held, meta([0x1234], width=640, height=480))
@@ -119,8 +84,7 @@ class TestResolver(unittest.TestCase):
         self.resolver.check(new, meta([0x1234], width=1920, height=1080),
                             allow_foreign_moves=True)
         self.assertFalse(os.path.exists(held))
-        self.assertTrue(os.path.isfile(
-            os.path.join(other, ORIGINAL_DIR, 'held_1.webm')))
+        self.assertTrue(os.path.isfile(new))
 
     def test_resolves_every_weaker_copy_in_one_pass(self):
         """A group of near-dupes must fully resolve in a single run."""
@@ -129,13 +93,11 @@ class TestResolver(unittest.TestCase):
             self.db.record_phash(held, meta([0x1234], width=640, height=480))
         new = self._make(self.thread, 'best.webm')
         self.resolver.check(new, meta([0x1234], width=1920, height=1080))
-        aside = os.path.join(self.thread, ORIGINAL_DIR)
-        self.assertEqual(sorted(os.listdir(aside)),
-                         ['a_1.webm', 'b_1.webm', 'c_1.webm'])
-        self.assertTrue(os.path.isfile(new))
+        remaining = sorted(os.listdir(self.thread))
+        self.assertEqual(remaining, ['best.webm'])
 
     def test_second_pass_is_idempotent(self):
-        """Re-checking must not relocate an already set-aside file again."""
+        """Re-checking after the loser is gone must not raise or double-count."""
         held = self._make(self.thread, 'held.webm')
         self.db.record_phash(held, meta([0x1234], width=640, height=480))
         new = self._make(self.thread, 'new.webm')
@@ -143,43 +105,34 @@ class TestResolver(unittest.TestCase):
         self.resolver.check(new, winner_meta)
         self.db.record_phash(new, winner_meta)
 
-        before = sorted(os.listdir(os.path.join(self.thread, ORIGINAL_DIR)))
+        deleted_before = self.resolver.deleted
         self.resolver.check(new, winner_meta)
-        after = sorted(os.listdir(os.path.join(self.thread, ORIGINAL_DIR)))
-        self.assertEqual(before, after)
-        self.assertFalse(os.path.isdir(
-            os.path.join(self.thread, ORIGINAL_DIR, ORIGINAL_DIR)))
+        self.assertEqual(self.resolver.deleted, deleted_before)
 
-    def test_counter_includes_displaced_held_copies(self):
-        """A winning file displaces several held copies; all must be counted."""
+    def test_counter_includes_every_deleted_held_copy(self):
+        """A winning file deletes several held copies; all must be counted."""
         for name in ('a.webm', 'b.webm', 'c.webm'):
             held = self._make(self.thread, name)
             self.db.record_phash(held, meta([0x1234], width=640, height=480))
         new = self._make(self.thread, 'best.webm')
-        returned = self.resolver.check(new, meta([0x1234], width=1920, height=1080))
-        # check() reports only the incoming file moving, which did not happen.
-        self.assertIsNone(returned)
-        self.assertEqual(self.resolver.relocated, 3)
+        deleted = self.resolver.check(new, meta([0x1234], width=1920, height=1080))
+        # check() reports only the incoming file being deleted, which did not happen.
+        self.assertFalse(deleted)
+        self.assertEqual(self.resolver.deleted, 3)
 
-    def test_md5_row_follows_the_relocated_file(self):
+    def test_md5_row_is_dropped_for_the_deleted_file(self):
         held = self._make(self.thread, 'held.webm')
         self.db.record_phash(held, meta([0x1234], width=640, height=480))
         self.db.insert('deadbeef', held, '1234', 111, 222)
         new = self._make(self.thread, 'new.webm')
         self.resolver.check(new, meta([0x1234], width=1920, height=1080))
-        moved = os.path.join(self.thread, ORIGINAL_DIR, 'held_1.webm')
-        self.assertEqual(self.db.get_path('deadbeef'), moved)
-
-    def test_is_set_aside(self):
-        from inb4404.near_dupe import is_set_aside
-        self.assertTrue(is_set_aside(os.path.join(self.thread, 'original', 'x.webm')))
-        self.assertFalse(is_set_aside(os.path.join(self.thread, 'x.webm')))
+        self.assertIsNone(self.db.get_path('deadbeef'))
 
     def test_stale_candidate_row_is_dropped(self):
         ghost = os.path.join(self.thread, 'ghost.webm')
         self.db.record_phash(ghost, meta([0x1234]))
         new = self._make(self.thread, 'new.webm')
-        self.assertIsNone(self.resolver.check(new, meta([0x1234])))
+        self.assertFalse(self.resolver.check(new, meta([0x1234])))
         self.assertIsNone(self.db.get_phash(ghost))
 
 

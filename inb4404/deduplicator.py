@@ -6,7 +6,6 @@ from typing import Dict, List, Tuple
 from .config import Config
 from .database import HashDB
 from .file_utils import FileManager
-from .near_dupe import ORIGINAL_DIR
 
 log = logging.getLogger('inb4404')
 
@@ -57,9 +56,6 @@ class Deduplicator:
         hashed = 0
 
         for root, dirs, files in os.walk(self.downloads_root):
-            # Resolved near-duplicates live here; walking them would re-detect
-            # every pair on every run.
-            dirs[:] = [d for d in dirs if d != ORIGINAL_DIR]
             for fn in files:
                 if fn == '.hashes.txt':
                     continue
@@ -182,7 +178,7 @@ class Deduplicator:
 
         Runs inside one `bulk_session`, which is safe only because
         `--dedupe-downloads` returns before any watcher process starts.
-        Cross-thread relocation is enabled for the same reason: this is the
+        Cross-thread deletion is enabled for the same reason: this is the
         one context with no concurrent writer.
 
         Returns:
@@ -201,7 +197,6 @@ class Deduplicator:
 
         with self.db.bulk_session() as conn:
             for root, dirs, files in os.walk(self.downloads_root):
-                dirs[:] = [d for d in dirs if d != ORIGINAL_DIR]
                 for fn in files:
                     if fn == '.hashes.txt':
                         continue
@@ -223,10 +218,10 @@ class Deduplicator:
                     resolver.check(full_path, meta,
                                    allow_foreign_moves=True, conn=conn)
 
-        # Read the resolver's own counter: check() reports only the incoming
-        # file being moved, while a winning file can displace several held
-        # copies in one call.
-        return (hashed, resolver.relocated)
+        # Read the resolver's own counter: check() reports only whether the
+        # incoming file was deleted, while a winning file can delete several
+        # held copies in one call.
+        return (hashed, resolver.deleted)
 
     def remove_legacy_files(self) -> None:
         """Remove legacy .hashes.txt files."""
@@ -259,7 +254,7 @@ class Deduplicator:
         if self.config.phash_enabled:
             hashed, resolved = self.run_phash_pass()
             log.info(f'Perceptual pass complete. Hashed {hashed} new files, '
-                     f'relocated {resolved} near-duplicates')
+                     f'deleted {resolved} near-duplicates')
 
         # Remove legacy files
         self.remove_legacy_files()

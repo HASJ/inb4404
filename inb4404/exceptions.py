@@ -1,4 +1,5 @@
 """Custom exception classes for inb4404."""
+from typing import Optional
 
 
 class Inb4404Error(Exception):
@@ -23,5 +24,7 @@ class DatabaseError(Inb4404Error):
 
 class HTTPError(Inb4404Error):
     """Raised when an HTTP request fails."""
-    pass
 
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
