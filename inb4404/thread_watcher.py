@@ -33,8 +33,8 @@ class ThreadWatcher:
         self.config = config
         self.workpath = workpath
         self.stop_event = stop_event
-        self.parser = ThreadParser()
-        self.http_client = HTTPClient()
+        self.http_client = HTTPClient(stop_event=self.stop_event)
+        self.parser = ThreadParser(http_client=self.http_client)
         # Initialize DB with proper path
         db_path = os.path.join(workpath, 'hashes.db')
         self.db = HashDB(db_path=db_path)
@@ -536,28 +536,14 @@ class ThreadWatcher:
                     self._sleep(sleep_time)
                     continue
 
-                # Try to reload thread
-                try:
-                    self._sleep(10)
-                    if self.stop_event and self.stop_event.is_set():
-                        break
-                    self.http_client.fetch(self.thread_url)
-                except ThreadNotFoundError:
-                    # Thread 404'd - exit with code 404
-                    import sys
-                    raise SystemExit(404)
-                except HTTPError as ex2:
-                    code = getattr(ex2, 'code', None)
-                    log.info(f'{self.thread_url} {code}\'d')
-                    if code == 404:
-                        import sys
-                        raise SystemExit(404)
-                    break
+                log.warning(f'Temporary error fetching {self.thread_url}: {ex}')
+                self._sleep(10)
                 continue
 
             except Exception as e:
-                log.fatal(f'{self.thread_url} crashed! {e}')
-                raise
+                log.warning(f'Unexpected error watching {self.thread_url}: {e}')
+                self._sleep(10)
+                continue
 
             # Sleep before next refresh
             self._sleep(self.config.refresh_time)

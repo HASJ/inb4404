@@ -10,6 +10,7 @@ from typing import Dict, Set, Optional, Any
 
 from .config import Config
 from .thread_watcher import ThreadWatcher
+from .thread_parser import ThreadURL
 from .http_client import HTTPClient
 from .exceptions import ThreadNotFoundError
 
@@ -57,10 +58,10 @@ def _call_watcher(thread_url: str, config: Config, workpath: str, stop_event: Op
         watcher.watch()
     except ValueError as e:
         log.error(f"Error starting watcher for {thread_url}: {e}")
-        raise SystemExit(404)
+        raise SystemExit(1)
     except KeyboardInterrupt:
         pass
-    except SystemExit as e:
+    except SystemExit:
         # Re-raise SystemExit to preserve exit code (e.g., 404)
         raise
 
@@ -80,25 +81,32 @@ class ProcessManager:
         self.config = config
         self.workpath = workpath
         self.running_processes: Dict[str, Process] = {}
-        self.http_client = HTTPClient()
         self._force_reload = threading.Event()
         self.stop_event = multiprocessing.Event()
+        self.http_client = HTTPClient(stop_event=self.stop_event)
         self._stop_input_thread = False
 
     def load_queue(self) -> Set[str]:
         """Load thread URLs from the queue file.
 
         Returns:
-            A set of valid thread URLs (lines starting with 'http' and not disabled).
+            A set of valid thread URLs (lines/tokens starting with 'http' and not disabled).
         """
         try:
             desired_links = set()
             with open(self.filename, 'r', encoding='utf-8') as f:
                 for line in f:
-                    # Split line to handle potential multiple URLs (error recovery)
-                    parts = line.strip().split()
+                    stripped = line.strip()
+                    # Skip empty lines and whole-line comments / disabled lines
+                    if not stripped or stripped.startswith('-') or stripped.startswith('#'):
+                        continue
+
+                    parts = stripped.split()
                     for part in parts:
-                        if part.startswith('http') and not part.startswith('-http'):
+                        # Skip tokens commented with # or disabled with - or -http
+                        if part.startswith('#') or part.startswith('-'):
+                            continue
+                        if part.startswith('http'):
                             desired_links.add(part)
             return desired_links
         except FileNotFoundError:
@@ -142,9 +150,8 @@ class ProcessManager:
     def check_dead_processes(self) -> Set[str]:
         """Check for dead processes and handle them appropriately."""
         dead_links = []
-        for link, process in self.running_processes.items():
+        for link, process in list(self.running_processes.items()):
             if not process.is_alive():
-                log.info(f'Thread {link} appears to be dead (404\'d or crashed).')
                 dead_links.append(link)
 
         if not dead_links:
@@ -158,6 +165,13 @@ class ProcessManager:
         
         return disabled_links
 
+    def _is_exitcode_404(self, exitcode: Optional[int]) -> bool:
+        """Check if an exit code indicates a 404 (handling POSIX 8-bit wrap)."""
+        if exitcode is None:
+            return False
+        # Windows: 404; POSIX (Linux/macOS): 404 % 256 = 148
+        return exitcode in (404, 404 % 256)
+
     def _handle_dead_process(self, link: str, max_restarts: int) -> bool:
         """Handle a dead process - check exit code, probe, and restart if needed.
 
@@ -168,8 +182,6 @@ class ProcessManager:
         Returns:
             True if the link was disabled, False otherwise.
         """
-        log.info(f'Watcher for {link} appears to have stopped; probing and attempting restart.')
-
         proc = self.running_processes.get(link)
         exitcode = None
         if proc:
@@ -179,20 +191,37 @@ class ProcessManager:
                 pass
 
         # If exit code is 404, immediately disable
-        if exitcode == 404:
+        if self._is_exitcode_404(exitcode):
             self._disable_link(link, reason='404')
             self.running_processes.pop(link, None)
             return True
 
-        # Quick probe: try to load the thread page to detect 404s
+        # Quick probe: try to load the thread page/API to detect 404s
         is_404 = False
         try:
-            self.http_client.fetch(link)
+            parsed = ThreadURL.parse(link)
+            # Try 4chan JSON API first
+            api_res = self.http_client.fetch_thread_api(parsed.board, parsed.thread_id)
+            if api_res is not None:
+                is_404 = False
+            else:
+                # If API returned None or failed, verify with canonical HTML without slug
+                try:
+                    self.http_client.fetch(parsed.canonical_url)
+                except ThreadNotFoundError:
+                    is_404 = True
+                except Exception:
+                    pass
         except ThreadNotFoundError:
             is_404 = True
         except Exception:
-            # Non-HTTP errors are ignored for the probe; we'll try restarts
-            pass
+            # Fallback probe with raw link
+            try:
+                self.http_client.fetch(link)
+            except ThreadNotFoundError:
+                is_404 = True
+            except Exception:
+                pass
 
         if is_404:
             self._disable_link(link, reason='404')
@@ -233,47 +262,92 @@ class ProcessManager:
             time.sleep(5 * attempt)
 
         if not restarted:
-            self._disable_link(link, reason='after failed restarts')
+            log.warning(f'Watcher for {link} stopped and could not be restarted. Leaving in queue.')
             self.running_processes.pop(link, None)
-            return True
+            return False
         
         return False
 
     def _disable_link(self, link: str, reason: str) -> None:
         """Disable a link in the queue file by prefixing with '-'.
 
+        Disables ALL occurrences of the thread in the queue file.
+
         Args:
             link: The thread URL to disable.
             reason: Reason for disabling (for logging).
         """
         try:
+            target_board = None
+            target_thread_id = None
+            try:
+                parsed = ThreadURL.parse(link)
+                target_board = parsed.board
+                target_thread_id = parsed.thread_id
+            except Exception:
+                pass
+
             with open(self.filename, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
-            # Find the line index to modify
-            line_index_to_disable = -1
-            for i, line in enumerate(lines):
-                # Match the link by comparing stripped content
-                if line.strip() == link:
-                    line_index_to_disable = i
-                    break
-            
-            # If we found a line to disable, modify it.
-            if line_index_to_disable != -1:
-                # Check if it's already disabled (ignoring leading whitespace)
-                if lines[line_index_to_disable].lstrip().startswith('-'):
-                    log.info(f"Link '{link}' is already disabled in {self.filename}.")
-                    return
+            modified = False
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    new_lines.append(line)
+                    continue
 
-                # Prepend the dash to the original line content
-                lines[line_index_to_disable] = '-' + lines[line_index_to_disable]
-                log.info(f'Disabled {link} in {self.filename} ({reason})')
+                # If line is already disabled or whole-line comment, keep it as is
+                if line.lstrip().startswith('-') or line.lstrip().startswith('#'):
+                    new_lines.append(line)
+                    continue
 
-                # Write the modified lines back to the file
+                # Check if this line contains our target link
+                parts = line.split()
+                line_has_match = False
+                new_parts = []
+                for part in parts:
+                    is_match = False
+                    if part.startswith('-') or part.startswith('#'):
+                        new_parts.append(part)
+                        continue
+
+                    if part == link:
+                        is_match = True
+                    elif target_board and target_thread_id:
+                        try:
+                            p_url = ThreadURL.parse(part)
+                            if p_url.board == target_board and p_url.thread_id == target_thread_id:
+                                is_match = True
+                        except Exception:
+                            pass
+
+                    if is_match:
+                        new_parts.append('-' + part)
+                        line_has_match = True
+                        modified = True
+                    else:
+                        new_parts.append(part)
+
+                if line_has_match:
+                    # If it was a simple single-URL line, preserve indentation
+                    if len(parts) == 1 and stripped == parts[0]:
+                        indent = line[:len(line) - len(line.lstrip())]
+                        trailing_nl = '\n' if line.endswith('\n') else ''
+                        new_lines.append(f"{indent}-{parts[0]}{trailing_nl}")
+                    else:
+                        trailing_nl = '\n' if line.endswith('\n') else ''
+                        new_lines.append(' '.join(new_parts) + trailing_nl)
+                else:
+                    new_lines.append(line)
+
+            if modified:
                 with open(self.filename, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
+                    f.writelines(new_lines)
+                log.info(f'Disabled {link} in {self.filename} ({reason})')
             else:
-                log.warning(f"Could not find link '{link}' in {self.filename} to disable it.")
+                log.info(f"Link '{link}' is already disabled or not found in {self.filename}.")
 
         except IOError as e:
             log.error(f'Error writing to file {self.filename}: {e}')
@@ -374,42 +448,24 @@ class ProcessManager:
                     self.stop_watcher(link)
 
                 if not self.config.reload:
-                    # If not reloading, wait for all spawned processes to complete
-                    # BUT, we still want to check for new inputs if the user provided any
-                    # even if reload=False was passed, we might want to support adding?
-                    # The original logic was: reload=False means "run once and exit when done".
-                    # However, "run once" with "interactive add" is ambiguous.
-                    # We will assume if they paste a link, they want it processed.
-                    
-                    # We wait on the force_reload event or for processes to finish.
-                    # Since join() is blocking, we can't easily wait for both input and join
-                    # without a loop.
-                    
-                    # Adapted logic:
-                    # We loop and check processes. If all dead/done, we break.
-                    # Unless a new link comes in.
+                    # Run until all processes have completed
                     while True:
                         if self._force_reload.is_set():
-                            # Break inner loop to reload queue
                             break
                         
-                        # Check if processes are still alive
+                        # Continuously process dead/404'd processes
+                        self.check_dead_processes()
+
                         alive_count = sum(1 for p in self.running_processes.values() if p.is_alive())
                         if alive_count == 0:
-                            # If no processes are running, we might be done.
-                            # But wait a bit to see if user pastes something?
-                            # For strict backward compatibility, if --reload wasn't passed,
-                            # we should exit. However, the user asked for this feature.
-                            # Let's keep the listener active for a short grace period or
-                            # just exit if the queue is genuinely empty/done.
-                            # For now, let's stick to the original "exit when done" behavior
-                            # unless the user triggers a reload explicitly.
+                            # Final pass to handle any remaining processes
+                            self.check_dead_processes()
                             break
                         
                         time.sleep(1)
                     
                     if not self._force_reload.is_set():
-                        break # Exit main loop if we broke for "all done" reason
+                        break
                         
                 else:
                     # If reloading is enabled:
@@ -419,23 +475,28 @@ class ProcessManager:
                             f'Watching {len(self.running_processes)} threads.'
                         )
                     
-                    # Wait for reload time OR force reload event
-                    self._force_reload.wait(timeout=60 * self.config.reload_time)
+                    # Wait for reload time while periodically checking dead processes
+                    start_wait = time.time()
+                    wait_seconds = 60 * self.config.reload_time
+                    while time.time() - start_wait < wait_seconds:
+                        if self._force_reload.is_set():
+                            break
+                        self.check_dead_processes()
+                        time.sleep(1)
+
         except KeyboardInterrupt:
             self._stop_input_thread = True
             log.info('Ctrl+C detected. Shutting down all watcher processes...')
             self.stop_event.set()
             
+            # Check dead processes before stopping
+            self.check_dead_processes()
+
             # Wait for processes to exit gracefully
-            start_time = time.time()
-            still_running = []
-            
-            for link, process in self.running_processes.items():
+            for link, process in list(self.running_processes.items()):
                 process.join(timeout=0.5)
-                if process.is_alive():
-                    still_running.append((link, process))
             
-            # If any are still running after a quick join attempt, wait a bit longer
+            still_running = [(l, p) for l, p in self.running_processes.items() if p.is_alive()]
             if still_running:
                 log.info(f'Waiting for {len(still_running)} processes to finish...')
                 for link, process in still_running:

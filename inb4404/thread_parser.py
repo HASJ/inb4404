@@ -23,6 +23,11 @@ class ThreadURL:
     thread_id: str
     slug: Optional[str] = None
 
+    @property
+    def canonical_url(self) -> str:
+        """Return the canonical thread URL without slug or query parameters."""
+        return f"https://boards.4chan.org/{self.board}/thread/{self.thread_id}"
+
     @classmethod
     def parse(cls, url: str) -> 'ThreadURL':
         """Parse and validate a thread URL into components.
@@ -62,14 +67,20 @@ class ThreadURL:
         thread_id = parts[2]
         slug = parts[3] if len(parts) > 3 else None
 
-        # Validate that board, thread_id, and slug (if present) are safe strings
+        # Validate that board and thread_id are safe strings
         pattern = re.compile(r'^[a-zA-Z0-9_-]+$')
         if not pattern.match(board):
             raise ValueError(f"Invalid board identifier: {board}")
-        if not pattern.match(thread_id):
+        if not re.match(r'^[0-9]+$', thread_id):
             raise ValueError(f"Invalid thread ID: {thread_id}")
-        if slug and not pattern.match(slug):
-            raise ValueError(f"Invalid slug: {slug}")
+
+        if slug:
+            # Reject directory traversal attempts in slug
+            if '..' in slug or '/' in slug or '\\' in slug:
+                raise ValueError(f"Invalid slug: {slug}")
+            slug = FileManager.sanitize_filename(slug)
+            if not slug:
+                slug = None
 
         return cls(url=url, board=board, thread_id=thread_id, slug=slug)
 
