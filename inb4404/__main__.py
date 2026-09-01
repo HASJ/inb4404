@@ -174,7 +174,7 @@ def main() -> None:
         '--backoff',
         type=float,
         default=0.5,
-        help='Delay in seconds by which throttle should increase on 429'
+        help='Delay in seconds by which media-download throttle increases after a thread-refresh 429; media 429s trigger the fixed global 10-minute cooldown'
     )
     parser.add_argument(
         '--origin-name',
@@ -264,4 +264,3 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         pass
-
