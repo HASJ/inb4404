@@ -7,7 +7,7 @@ import logging
 import hashlib
 from typing import List, Tuple, Optional, Set, Dict, Any
 
-from .config import Config, EXITCODE_MAINTENANCE
+from .config import Config, DEFAULT_RATE_LIMIT_WAIT, EXITCODE_MAINTENANCE
 from .database import HashDB
 from .http_client import HTTPClient
 from .file_utils import FileManager
@@ -27,6 +27,7 @@ class ThreadWatcher:
         workpath: str,
         stop_event: Optional[Any] = None,
         raise_on_maintenance: bool = False,
+        rate_limit_until: Optional[Any] = None,
     ):
         """Initialize the ThreadWatcher.
 
@@ -36,12 +37,15 @@ class ThreadWatcher:
             workpath: Base working directory path.
             stop_event: Optional threading/multiprocessing Event to signal shutdown.
             raise_on_maintenance: If True, raise SystemExit(EXITCODE_MAINTENANCE) on maintenance.
+            rate_limit_until: Optional shared deadline for rate-limit cooldowns.
         """
         self.thread_url = thread_url
         self.config = config
         self.workpath = workpath
         self.stop_event = stop_event
         self.raise_on_maintenance = raise_on_maintenance
+        self.rate_limit_until = rate_limit_until
+        self._local_rate_limit_until = 0.0
         self.http_client = HTTPClient(stop_event=self.stop_event)
         self.parser = ThreadParser(http_client=self.http_client)
         # Initialize DB with proper path
@@ -90,6 +94,42 @@ class ThreadWatcher:
         else:
             time.sleep(seconds)
 
+    def _get_rate_limit_until(self) -> float:
+        """Return the active shared or local rate-limit deadline."""
+        if self.rate_limit_until is not None:
+            return self.rate_limit_until.value
+        return self._local_rate_limit_until
+
+    def _wait_for_rate_limit(self) -> bool:
+        """Wait until the shared rate-limit cooldown expires.
+
+        Returns:
+            False if shutdown was requested while waiting, otherwise True.
+        """
+        while not (self.stop_event and self.stop_event.is_set()):
+            remaining = self._get_rate_limit_until() - time.time()
+            if remaining <= 0:
+                return True
+            log.warning(
+                f'Rate limit cooldown active for {self.board}/{self.thread_id}; '
+                f'waiting {remaining / 60.0:.1f} minutes.'
+            )
+            self._sleep(remaining)
+        return False
+
+    def _start_rate_limit_cooldown(self) -> None:
+        """Start the ten-minute rate-limit cooldown if none is active."""
+        now = time.time()
+        deadline = now + DEFAULT_RATE_LIMIT_WAIT
+        if self.rate_limit_until is None:
+            if self._local_rate_limit_until <= now:
+                self._local_rate_limit_until = deadline
+            return
+
+        with self.rate_limit_until.get_lock():
+            if self.rate_limit_until.value <= now:
+                self.rate_limit_until.value = deadline
+
     def _determine_directory_name(self) -> str:
         """Determine the directory name to use for this thread.
 
@@ -107,6 +147,8 @@ class ThreadWatcher:
         # Logic for --subject: override directory name with "ID (Subject)"
         if self.config.subject:
             try:
+                if not self._wait_for_rate_limit():
+                    return thread_dir_name
                 subject = self.parser.get_subject(self.board, self.thread_id)
                 if subject:
                     thread_dir_name = f"{self.thread_id} ({subject})"
@@ -390,7 +432,10 @@ class ThreadWatcher:
                 display_save = os.path.basename(img_path) or (img or '')
                 log.debug(f'Downloading {display_save} from {self.board}/{self.thread_dir_name} (url: {link})')
 
-            data = self.http_client.fetch(link)
+            if not self._wait_for_rate_limit():
+                return count + 1
+
+            data = self.http_client.fetch(link, retry_on_429=False)
             data_hash = self.file_manager.compute_hash_bytes(data)
 
             # Double-check after download
@@ -413,6 +458,8 @@ class ThreadWatcher:
         except MaintenanceError:
             raise
         except (HTTPError, ThreadNotFoundError) as e:
+            if isinstance(e, HTTPError) and e.code == 429:
+                self._start_rate_limit_cooldown()
             log.warning(f'Failed to download {link}: {e}')
         except OSError as e:
             if e.errno == 22:
@@ -524,6 +571,8 @@ class ThreadWatcher:
 
         # Main polling loop
         while not (self.stop_event and self.stop_event.is_set()):
+            if not self._wait_for_rate_limit():
+                break
             try:
                 # Fetch thread data
                 items, all_titles = self._fetch_thread_data()

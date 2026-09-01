@@ -17,6 +17,7 @@ DEFAULT_REFRESH_TIME = 20.0  # seconds
 DEFAULT_RELOAD_TIME = 5.0  # minutes
 DEFAULT_THROTTLE = 0.5  # seconds
 DEFAULT_BACKOFF = 0.5  # seconds
+DEFAULT_RATE_LIMIT_WAIT = 600.0  # seconds (10 minutes)
 DB_TIMEOUT = 30  # seconds
 DEFAULT_MAINTENANCE_INITIAL_WAIT = 1800.0  # seconds (30 minutes)
 DEFAULT_MAINTENANCE_WAIT_INCREMENT = 1800.0  # seconds (30 minutes)

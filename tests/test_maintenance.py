@@ -1,4 +1,5 @@
 """Tests for server maintenance detection, escalating backoff, and watcher coordination."""
+import multiprocessing
 import os
 import shutil
 import tempfile
@@ -225,6 +226,301 @@ class TestThreadWatcherMaintenance(unittest.TestCase):
             watcher.watch()
 
         self.assertEqual(ctx.exception.code, EXITCODE_MAINTENANCE)
+
+
+class TestThreadWatcherRateLimit(unittest.TestCase):
+    """Test shared cooldown behavior after media-download rate limiting."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.config = Config(workpath=self.tmp_dir, phash_enabled=False)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _watcher(self, stop_event=None, rate_limit_until=None, subject=None):
+        config = Config(
+            workpath=self.tmp_dir,
+            phash_enabled=False,
+            subject=self.config.subject if subject is None else subject,
+        )
+        return ThreadWatcher(
+            'https://boards.4chan.org/g/thread/1000',
+            config,
+            self.tmp_dir,
+            stop_event=stop_event,
+            rate_limit_until=rate_limit_until,
+        )
+
+    def test_media_429_stops_retries_and_sets_shared_ten_minute_deadline(self):
+        """The first media 429 starts a shared ten-minute cooldown immediately."""
+        rate_limit_until = multiprocessing.Value('d', 0.0)
+        watcher = self._watcher(rate_limit_until=rate_limit_until, subject=False)
+        watcher._determine_file_path = MagicMock(
+            return_value=os.path.join(self.tmp_dir, 'file.jpg')
+        )
+        watcher.http_client._sleep = MagicMock()
+        watcher._sleep = MagicMock()
+
+        http_429 = urllib.error.HTTPError(
+            'https://i.4cdn.org/g/1.jpg',
+            429,
+            'Too Many Requests',
+            {},
+            None,
+        )
+        http_429.read = MagicMock(return_value=b'Rate limit exceeded.')
+        self.addCleanup(http_429.close)
+
+        with patch('urllib.request.urlopen', side_effect=http_429) as mock_urlopen:
+            with patch('inb4404.thread_watcher.time.time', return_value=1000.0):
+                watcher._process_file_entry(
+                    ('https://i.4cdn.org/g/1.jpg', 'file.jpg', None),
+                    0,
+                    [],
+                    1,
+                    1,
+                )
+
+        self.assertEqual(mock_urlopen.call_count, 1)
+        watcher.http_client._sleep.assert_not_called()
+        self.assertEqual(rate_limit_until.value, 1600.0)
+
+    def test_in_flight_429_does_not_extend_active_deadline(self):
+        """Later 429s while cooldown is active do not extend deadline; after expiry a new 429 resets it."""
+        rate_limit_until = multiprocessing.Value('d', 1600.0)
+        watcher = self._watcher(rate_limit_until=rate_limit_until, subject=False)
+        watcher._determine_file_path = MagicMock(
+            return_value=os.path.join(self.tmp_dir, 'file.jpg')
+        )
+        watcher.http_client._sleep = MagicMock()
+        watcher._sleep = MagicMock()
+        # Simulate in-flight request that already passed the gate
+        watcher._wait_for_rate_limit = MagicMock(return_value=True)
+
+        http_429 = urllib.error.HTTPError(
+            'https://i.4cdn.org/g/1.jpg',
+            429,
+            'Too Many Requests',
+            {},
+            None,
+        )
+        http_429.read = MagicMock(return_value=b'Rate limit exceeded.')
+        self.addCleanup(http_429.close)
+
+        # In-flight 429 at now=1030 while deadline is 1600: must NOT extend to 1630
+        with patch('urllib.request.urlopen', side_effect=http_429):
+            with patch('inb4404.thread_watcher.time.time', return_value=1030.0):
+                watcher._process_file_entry(
+                    ('https://i.4cdn.org/g/1.jpg', 'file.jpg', None),
+                    0,
+                    [],
+                    1,
+                    1,
+                )
+
+        self.assertEqual(rate_limit_until.value, 1600.0)
+
+        # After deadline expiry at now=1605: new 429 sets 1605 + 600 = 2205
+        with patch('urllib.request.urlopen', side_effect=http_429):
+            with patch('inb4404.thread_watcher.time.time', return_value=1605.0):
+                watcher._process_file_entry(
+                    ('https://i.4cdn.org/g/1.jpg', 'file.jpg', None),
+                    0,
+                    [],
+                    1,
+                    1,
+                )
+
+        self.assertEqual(rate_limit_until.value, 2205.0)
+
+    def test_local_rate_limit_cooldown_semantics(self):
+        """Local cooldown (rate_limit_until=None) starts at now+600 and is not extended while active."""
+        watcher = self._watcher(rate_limit_until=None, subject=False)
+        watcher._determine_file_path = MagicMock(
+            return_value=os.path.join(self.tmp_dir, 'file.jpg')
+        )
+        watcher.http_client._sleep = MagicMock()
+        watcher._sleep = MagicMock()
+        watcher._wait_for_rate_limit = MagicMock(return_value=True)
+
+        http_429 = urllib.error.HTTPError(
+            'https://i.4cdn.org/g/1.jpg',
+            429,
+            'Too Many Requests',
+            {},
+            None,
+        )
+        http_429.read = MagicMock(return_value=b'Rate limit exceeded.')
+        self.addCleanup(http_429.close)
+
+        # First 429 at now=1000 sets local deadline to 1600
+        with patch('urllib.request.urlopen', side_effect=http_429):
+            with patch('inb4404.thread_watcher.time.time', return_value=1000.0):
+                watcher._process_file_entry(
+                    ('https://i.4cdn.org/g/1.jpg', 'file.jpg', None),
+                    0,
+                    [],
+                    1,
+                    1,
+                )
+        self.assertEqual(watcher._get_rate_limit_until(), 1600.0)
+
+        # Subsequent 429 at now=1030 does not extend
+        with patch('urllib.request.urlopen', side_effect=http_429):
+            with patch('inb4404.thread_watcher.time.time', return_value=1030.0):
+                watcher._process_file_entry(
+                    ('https://i.4cdn.org/g/1.jpg', 'file.jpg', None),
+                    0,
+                    [],
+                    1,
+                    1,
+                )
+        self.assertEqual(watcher._get_rate_limit_until(), 1600.0)
+
+    def test_startup_subject_lookup_gated_by_active_cooldown(self):
+        """Startup subject lookup waits for an active cooldown before making request."""
+        rate_limit_until = multiprocessing.Value('d', 1600.0)
+        now = [1000.0]
+        sleep_calls = []
+
+        config = Config(workpath=self.tmp_dir, phash_enabled=False, subject=True)
+
+        def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            now[0] += seconds
+
+        with patch('inb4404.thread_watcher.time.time', side_effect=lambda: now[0]):
+            with patch('inb4404.thread_parser.ThreadParser.get_subject', return_value='Test Subject') as mock_get_subj:
+                with patch.object(ThreadWatcher, '_sleep', side_effect=fake_sleep):
+                    watcher = ThreadWatcher(
+                        'https://boards.4chan.org/g/thread/1000',
+                        config,
+                        self.tmp_dir,
+                        rate_limit_until=rate_limit_until,
+                    )
+
+        self.assertEqual(sleep_calls, [600.0])
+        mock_get_subj.assert_called_once_with('g', '1000')
+        self.assertEqual(watcher.thread_dir_name, '1000 (Test Subject)')
+
+    def test_startup_subject_lookup_aborts_on_stop_event(self):
+        """Startup subject lookup does not perform network request if stop_event is set during wait."""
+        rate_limit_until = multiprocessing.Value('d', 1600.0)
+        stop_event = threading.Event()
+        stop_event.set()
+
+        config = Config(workpath=self.tmp_dir, phash_enabled=False, subject=True)
+
+        with patch('inb4404.thread_watcher.time.time', return_value=1000.0):
+            with patch('inb4404.thread_parser.ThreadParser.get_subject') as mock_get_subj:
+                with patch.object(ThreadWatcher, '_sleep') as mock_sleep:
+                    watcher = ThreadWatcher(
+                        'https://boards.4chan.org/g/thread/1000',
+                        config,
+                        self.tmp_dir,
+                        stop_event=stop_event,
+                        rate_limit_until=rate_limit_until,
+                    )
+
+        mock_get_subj.assert_not_called()
+        mock_sleep.assert_not_called()
+        self.assertEqual(watcher.thread_dir_name, '1000')
+
+    def test_watcher_waits_for_shared_rate_limit_before_refreshing(self):
+        """A watcher waits for the shared cooldown before its next request."""
+        stop_event = threading.Event()
+        rate_limit_until = multiprocessing.Value('d', 1600.0)
+        watcher = self._watcher(
+            stop_event=stop_event,
+            rate_limit_until=rate_limit_until,
+            subject=False,
+        )
+        watcher._load_existing_hashes = MagicMock()
+        watcher._scan_directory = MagicMock()
+        watcher._fetch_thread_data = MagicMock(return_value=([], []))
+
+        now = [1000.0]
+        sleep_calls = []
+
+        def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            now[0] += seconds
+            stop_event.set()
+
+        watcher._sleep = MagicMock(side_effect=fake_sleep)
+
+        with patch('inb4404.thread_watcher.time.time', side_effect=lambda: now[0]):
+            watcher.watch()
+
+        self.assertEqual(sleep_calls, [600.0])
+        watcher._fetch_thread_data.assert_not_called()
+
+    def test_media_download_waits_for_shared_rate_limit(self):
+        """_process_file_entry waits for active cooldown before downloading media."""
+        rate_limit_until = multiprocessing.Value('d', 1600.0)
+        watcher = self._watcher(rate_limit_until=rate_limit_until, subject=False)
+        watcher._determine_file_path = MagicMock(
+            return_value=os.path.join(self.tmp_dir, 'file.jpg')
+        )
+        now = [1000.0]
+        sleep_calls = []
+
+        def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            now[0] += seconds
+
+        watcher._sleep = MagicMock(side_effect=fake_sleep)
+        watcher.http_client.fetch = MagicMock(return_value=b'filedata')
+        watcher._save_file = MagicMock()
+        watcher._phash_new_file = MagicMock()
+
+        with patch('inb4404.thread_watcher.time.time', side_effect=lambda: now[0]):
+            watcher._process_file_entry(
+                ('https://i.4cdn.org/g/1.jpg', 'file.jpg', None),
+                0,
+                [],
+                1,
+                1,
+            )
+
+        self.assertEqual(sleep_calls, [600.0, watcher.throttle])
+        watcher.http_client.fetch.assert_called_once_with('https://i.4cdn.org/g/1.jpg', retry_on_429=False)
+
+    def test_media_download_aborts_on_stop_event_during_cooldown(self):
+        """_process_file_entry does not download if stop_event is set during cooldown wait."""
+        stop_event = threading.Event()
+        stop_event.set()
+        rate_limit_until = multiprocessing.Value('d', 1600.0)
+        watcher = self._watcher(stop_event=stop_event, rate_limit_until=rate_limit_until, subject=False)
+        watcher._determine_file_path = MagicMock(
+            return_value=os.path.join(self.tmp_dir, 'file.jpg')
+        )
+        watcher._sleep = MagicMock()
+        watcher.http_client.fetch = MagicMock()
+
+        with patch('inb4404.thread_watcher.time.time', return_value=1000.0):
+            watcher._process_file_entry(
+                ('https://i.4cdn.org/g/1.jpg', 'file.jpg', None),
+                0,
+                [],
+                1,
+                1,
+            )
+
+        watcher.http_client.fetch.assert_not_called()
+
+    def test_wait_for_rate_limit_no_cooldown_returns_immediately(self):
+        """_wait_for_rate_limit returns True immediately without sleeping when no cooldown is active."""
+        rate_limit_until = multiprocessing.Value('d', 0.0)
+        watcher = self._watcher(rate_limit_until=rate_limit_until, subject=False)
+        watcher._sleep = MagicMock()
+
+        with patch('inb4404.thread_watcher.time.time', return_value=1000.0):
+            res = watcher._wait_for_rate_limit()
+
+        self.assertTrue(res)
+        watcher._sleep.assert_not_called()
 
 
 class TestProcessManagerMaintenance(unittest.TestCase):

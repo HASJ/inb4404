@@ -105,6 +105,7 @@ class HTTPClient:
         initial_wait: float = 1.0,
         wait_increment: float = 1.0,
         timeout: float = 15.0,
+        retry_on_429: bool = True,
     ) -> bytes:
         """Perform an HTTP GET and return the raw bytes of the response.
 
@@ -123,6 +124,7 @@ class HTTPClient:
             initial_wait: Wait time in seconds before the first retry (default: 1.0).
             wait_increment: Amount in seconds by which wait time increases with each retry (default: 1.0).
             timeout: Timeout in seconds for the request (default: 15.0).
+            retry_on_429: Whether to retry HTTP 429 responses (default: True).
 
         Returns:
             The raw content of the response.
@@ -177,6 +179,9 @@ class HTTPClient:
                     raise
                 except Exception:
                     pass
+
+                if e.code == 429 and not retry_on_429:
+                    raise HTTPError(f'HTTP error {e.code} for {url}', code=e.code) from e
 
                 if e.code == 404:
                     raise ThreadNotFoundError(f'Thread not found: {url}') from e

@@ -17,7 +17,13 @@ from .exceptions import ThreadNotFoundError, MaintenanceError, HTTPError
 log = logging.getLogger('inb4404')
 
 
-def _call_watcher(thread_url: str, config: Config, workpath: str, stop_event: Optional[Any] = None) -> None:
+def _call_watcher(
+    thread_url: str,
+    config: Config,
+    workpath: str,
+    stop_event: Optional[Any] = None,
+    rate_limit_until: Optional[Any] = None,
+) -> None:
     """Helper wrapper used when spawning a multiprocessing.Process.
 
     The Process target should be a picklable callable; this thin wrapper lets
@@ -34,6 +40,7 @@ def _call_watcher(thread_url: str, config: Config, workpath: str, stop_event: Op
         config: Configuration settings.
         workpath: Base working directory path.
         stop_event: Optional multiprocessing Event to signal shutdown.
+        rate_limit_until: Optional shared wall-clock deadline for rate-limit cooldowns.
     """
     try:
         # Configure logging for child process
@@ -55,7 +62,12 @@ def _call_watcher(thread_url: str, config: Config, workpath: str, stop_event: Op
 
     try:
         watcher = ThreadWatcher(
-            thread_url, config, workpath, stop_event=stop_event, raise_on_maintenance=True
+            thread_url,
+            config,
+            workpath,
+            stop_event=stop_event,
+            raise_on_maintenance=True,
+            rate_limit_until=rate_limit_until,
         )
         watcher.watch()
     except ValueError as e:
@@ -88,6 +100,7 @@ class ProcessManager:
         self.running_processes: Dict[str, Process] = {}
         self._force_reload = threading.Event()
         self.stop_event = multiprocessing.Event()
+        self.rate_limit_until = multiprocessing.Value('d', 0.0)
         self.http_client = HTTPClient(stop_event=self.stop_event)
         self._stop_input_thread = False
 
@@ -132,7 +145,7 @@ class ProcessManager:
         log.info(f'Starting new watcher for {link}')
         process = Process(
             target=_call_watcher,
-            args=(link, self.config, self.workpath, self.stop_event)
+            args=(link, self.config, self.workpath, self.stop_event, self.rate_limit_until)
         )
         process.start()
         self.running_processes[link] = process
@@ -344,7 +357,7 @@ class ProcessManager:
 
                 new_proc = Process(
                     target=_call_watcher,
-                    args=(link, self.config, self.workpath, self.stop_event)
+                    args=(link, self.config, self.workpath, self.stop_event, self.rate_limit_until)
                 )
                 new_proc.start()
                 time.sleep(1)  # Give it a moment to start

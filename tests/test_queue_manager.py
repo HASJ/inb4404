@@ -29,6 +29,55 @@ class TestQueueManager(unittest.TestCase):
         with open(self.queue_file, 'r', encoding='utf-8') as f:
             return f.read()
 
+    def test_process_manager_creates_shared_rate_limit_deadline(self):
+        """The process manager owns shared cooldown state for all watchers."""
+        self.assertTrue(hasattr(self.pm, 'rate_limit_until'))
+        self.assertEqual(self.pm.rate_limit_until.value, 0.0)
+
+    def test_start_watcher_passes_shared_rate_limit_to_child(self):
+        """New watcher processes receive the process-wide cooldown state."""
+        link = "https://boards.4chan.org/gif/thread/1000"
+        shared_rate_limit = object()
+        self.pm.rate_limit_until = shared_rate_limit
+
+        with patch('inb4404.process_manager.Process') as process_class:
+            self.pm.start_watcher(link)
+
+        process_args = process_class.call_args.kwargs['args']
+        self.assertEqual(
+            process_args,
+            (link, self.config, self.tmp_dir, self.pm.stop_event, shared_rate_limit),
+        )
+
+    def test_handle_dead_process_restart_passes_shared_rate_limit_to_child(self):
+        """Restarted watcher processes receive the process-wide cooldown state."""
+        link = "https://boards.4chan.org/gif/thread/1000"
+        self._write_queue(f"{link}\n")
+
+        shared_rate_limit = object()
+        self.pm.rate_limit_until = shared_rate_limit
+
+        proc = MagicMock()
+        proc.exitcode = 1
+        proc.is_alive.return_value = False
+        self.pm.running_processes[link] = proc
+
+        self.pm.http_client.fetch_thread_api = MagicMock(return_value={'posts': []})
+
+        with patch('inb4404.process_manager.Process') as process_class:
+            mock_new_proc = MagicMock()
+            mock_new_proc.is_alive.return_value = True
+            process_class.return_value = mock_new_proc
+
+            with patch('time.sleep'):
+                self.pm._handle_dead_process(link, max_restarts=1)
+
+        process_args = process_class.call_args.kwargs['args']
+        self.assertEqual(
+            process_args,
+            (link, self.config, self.tmp_dir, self.pm.stop_event, shared_rate_limit),
+        )
+
     def test_load_queue_simple_and_disabled(self):
         self._write_queue(
             "https://boards.4chan.org/gif/thread/1000\n"
