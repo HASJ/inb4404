@@ -1,7 +1,7 @@
 *.webm|*.mp4|*.jpg|*.webp|*.png|*.gif|*.pyc
 links.txt
 .hashes.txt
-hashes.db
+hashes.*
 inb4404.pyb
 inb4404.pybb
 inb4404b.py
