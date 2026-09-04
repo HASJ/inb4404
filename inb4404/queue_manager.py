@@ -110,7 +110,10 @@ class DownloadWorker(threading.Thread):
             except Exception as e:
                 log.warning(f"Unexpected error downloading {task.link}: {e}")
             finally:
+                if hasattr(task, 'watcher') and hasattr(task.watcher, 'decrement_pending_tasks'):
+                    task.watcher.decrement_pending_tasks()
                 self.task_queue.task_done()
+
 
 
 class QueueManager:
@@ -521,6 +524,7 @@ class QueueManager:
         try:
             items, all_titles = watcher._fetch_thread_data()
             total = len(items)
+            new_tasks = 0
             for enum_index, enum_tuple in enumerate(items):
                 if self.stop_event.is_set():
                     break
@@ -532,7 +536,32 @@ class QueueManager:
                     enum_index + 1
                 )
                 if task is not None:
+                    if hasattr(watcher, 'increment_pending_tasks'):
+                        watcher.increment_pending_tasks(1)
                     self.download_queue.put(task)
+                    new_tasks += 1
+
+            if hasattr(watcher, 'has_completed_cycle'):
+                watcher.has_completed_cycle = True
+            if hasattr(watcher, 'last_item_count'):
+                watcher.last_item_count = total
+
+            # Check if archived and all files downloaded/skipped
+            is_archived = getattr(watcher, 'is_archived', False)
+            if not is_archived and hasattr(watcher, 'check_if_archived'):
+                is_archived = watcher.check_if_archived()
+
+            pending = getattr(watcher, 'pending_tasks', 0)
+            if is_archived:
+                if new_tasks == 0 and pending == 0:
+                    log.info(f"Thread {link} is archived and all files downloaded/skipped. Disabling.")
+                    self._disable_link(link, reason='archived')
+                    self.stop_watcher(link)
+                    return
+                else:
+                    # Still downloading pending files; check back soon
+                    self.poll_schedule[link] = time.time() + min(5.0, self.config.refresh_time)
+                    return
 
             self.poll_schedule[link] = time.time() + self.config.refresh_time
 
@@ -549,11 +578,40 @@ class QueueManager:
                 self._start_rate_limit_cooldown()
                 self.poll_schedule[link] = time.time() + 10 + self.config.throttle
             else:
+                is_archived = getattr(watcher, 'is_archived', False)
+                if not is_archived and hasattr(watcher, 'check_if_archived'):
+                    is_archived = watcher.check_if_archived()
+                completed = getattr(watcher, 'has_completed_cycle', False)
+                pending = getattr(watcher, 'pending_tasks', 0)
+                if is_archived and completed and pending == 0:
+                    log.info(
+                        f"Thread {link} is archived and all files downloaded/skipped "
+                        f"(handled error: {ex}). Disabling."
+                    )
+                    self._disable_link(link, reason='archived')
+                    self.stop_watcher(link)
+                    return
+
                 log.warning(f"Temporary error fetching {link}: {ex}")
                 self.poll_schedule[link] = time.time() + 10
         except Exception as e:
+            is_archived = getattr(watcher, 'is_archived', False)
+            if not is_archived and hasattr(watcher, 'check_if_archived'):
+                is_archived = watcher.check_if_archived()
+            completed = getattr(watcher, 'has_completed_cycle', False)
+            pending = getattr(watcher, 'pending_tasks', 0)
+            if is_archived and completed and pending == 0:
+                log.info(
+                    f"Thread {link} is archived and all files downloaded/skipped "
+                    f"(handled error: {e}). Disabling."
+                )
+                self._disable_link(link, reason='archived')
+                self.stop_watcher(link)
+                return
+
             log.warning(f"Unexpected error watching {link}: {e}")
             self.poll_schedule[link] = time.time() + 10
+
 
     def run(self) -> None:
         """Main scheduler loop - single process managing all threads and downloads."""

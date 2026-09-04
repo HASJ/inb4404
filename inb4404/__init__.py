@@ -1,3 +1,3 @@
 """inb4404 - Lightweight thread watcher/downloader for 4chan-style imageboard threads."""
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
