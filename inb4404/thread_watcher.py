@@ -375,6 +375,134 @@ class ThreadWatcher:
         return os.path.join(self.directory, sanitized_name)
 
 
+    def prepare_download_task(
+        self,
+        enum_tuple: Tuple,
+        enum_index: int,
+        all_titles: List[str],
+        total: int,
+        count: int
+    ) -> Optional[Any]:
+        """Determine file path, check existing files/MD5, and return DownloadTask if new."""
+        # Determine file path
+        img_path = self._determine_file_path(enum_tuple, enum_index, all_titles)
+        if not img_path or os.path.exists(img_path):
+            return None
+
+        # Unpack for MD5 checking
+        link = enum_tuple[0] if len(enum_tuple) >= 1 else None
+        img = enum_tuple[1] if len(enum_tuple) >= 2 else None
+        api_md5_hex = enum_tuple[2] if len(enum_tuple) >= 3 else None
+        api_md5_b64 = enum_tuple[3] if len(enum_tuple) >= 4 else None
+        original_name = enum_tuple[4] if len(enum_tuple) >= 5 else None
+        tim = enum_tuple[5] if len(enum_tuple) >= 6 else None
+        ext = enum_tuple[6] if len(enum_tuple) >= 7 else None
+
+        if not link:
+            if self.config.verbose:
+                log.warning(f'Skipping item with missing link at index {enum_index} in {self.board}/{self.thread_dir_name}')
+            return None
+
+        # Check API MD5 before downloading
+        if api_md5_hex:
+            gpath = self.db.get_path(api_md5_hex)
+            if gpath:
+                if self.config.verbose:
+                    log.debug(f'Duplicate (global API md5) skipping {img} (MD5: {api_md5_hex})')
+                return None
+            if api_md5_hex in self.md5_hashes:
+                if self.config.verbose:
+                    log.debug(f'Duplicate (thread API md5) skipping {img} (MD5: {api_md5_hex})')
+                return None
+
+        from .queue_manager import DownloadTask
+        return DownloadTask(
+            watcher=self,
+            link=link,
+            img=img,
+            img_path=img_path,
+            api_md5_hex=api_md5_hex,
+            api_md5_b64=api_md5_b64,
+            original_name=original_name,
+            tim=tim,
+            ext=ext,
+            total=total,
+            count=count,
+            enum_tuple=enum_tuple,
+        )
+
+    def execute_download_task(self, task: Any) -> bool:
+        """Download and save a file defined by task.
+
+        Returns:
+            True if file was successfully downloaded and saved, False otherwise.
+        """
+        if os.path.exists(task.img_path):
+            return False
+
+        if task.api_md5_hex:
+            if self.db.get_path(task.api_md5_hex) or task.api_md5_hex in self.md5_hashes:
+                return False
+
+        try:
+            if self.config.verbose:
+                display_save = os.path.basename(task.img_path) or (task.img or '')
+                log.debug(f'Downloading {display_save} from {self.board}/{self.thread_dir_name} (url: {task.link})')
+
+            if not self._wait_for_rate_limit():
+                return False
+
+            data = self.http_client.fetch(task.link, retry_on_429=False)
+            data_hash = self.file_manager.compute_hash_bytes(data)
+
+            # Double-check after download
+            if data_hash in self.md5_hashes or self.db.has_hash(data_hash):
+                if self.config.verbose:
+                    log.debug(f'Duplicate found after download (MD5: {data_hash}), skipping {task.img or ""}')
+                return False
+
+            # Save the file
+            self._save_file(task.img_path, data, data_hash, task.total, task.count)
+
+            # Reaching here means the file survived both MD5 checks
+            self._phash_new_file(task.img_path)
+
+            # Delay between downloads
+            self._sleep(self.throttle)
+            return True
+
+        except MaintenanceError:
+            raise
+        except (HTTPError, ThreadNotFoundError) as e:
+            if isinstance(e, HTTPError) and e.code == 429:
+                self._start_rate_limit_cooldown()
+            log.warning(f'Failed to download {task.link}: {e}')
+            return False
+        except OSError as e:
+            if e.errno == 22:
+                link, img, api_md5_hex, api_md5_b64, original_name, tim, ext = (list(task.enum_tuple) + [None] * 7)[:7]
+                if tim and ext:
+                    fallback_name = str(tim) + ext
+                elif img:
+                    fallback_name = os.path.basename(img)
+                else:
+                    fallback_name = f"fallback_{int(time.time())}"
+
+                fallback_path = os.path.join(self.directory, fallback_name)
+                if self.config.verbose:
+                    log.warning(f'Invalid filename "{os.path.basename(task.img_path)}", retrying with server name "{fallback_name}"')
+                try:
+                    self._save_file(fallback_path, data, data_hash, task.total, task.count)
+                    return True
+                except Exception as retry_e:
+                    log.warning(f'Failed to save fallback file {fallback_path}: {retry_e}')
+            else:
+                log.warning(f'Unexpected error downloading {task.link}: {e}')
+            return False
+        except Exception as e:
+            log.warning(f'Unexpected error downloading {task.link}: {e}')
+            return False
+
     def _process_file_entry(
         self,
         enum_tuple: Tuple,
@@ -383,7 +511,7 @@ class ThreadWatcher:
         total: int,
         count: int
     ) -> int:
-        """Process a single file entry.
+        """Process a single file entry synchronously.
 
         Args:
             enum_tuple: The file entry tuple.
@@ -395,99 +523,10 @@ class ThreadWatcher:
         Returns:
             Updated count.
         """
-        # Determine file path
-        img_path = self._determine_file_path(enum_tuple, enum_index, all_titles)
-        if not img_path:
-            return count + 1
-
-        # Check if file already exists
-        if os.path.exists(img_path):
-            return count + 1
-
-        # Unpack for MD5 checking
-        link = enum_tuple[0] if len(enum_tuple) >= 1 else None
-        img = enum_tuple[1] if len(enum_tuple) >= 2 else None
-        api_md5_hex = enum_tuple[2] if len(enum_tuple) >= 3 else None
-
-        # Check API MD5 before downloading
-        if api_md5_hex:
-            gpath = self.db.get_path(api_md5_hex)
-            if gpath:
-                if self.config.verbose:
-                    log.debug(f'Duplicate (global API md5) skipping {img} (MD5: {api_md5_hex})')
-                return count + 1
-            if api_md5_hex in self.md5_hashes:
-                if self.config.verbose:
-                    log.debug(f'Duplicate (thread API md5) skipping {img} (MD5: {api_md5_hex})')
-                return count + 1
-
-        # Download the file
-        if not link:
-            if self.config.verbose:
-                log.warning(f'Skipping item with missing link at index {enum_index} in {self.board}/{self.thread_dir_name}')
-            return count + 1
-
-        try:
-            if self.config.verbose:
-                display_save = os.path.basename(img_path) or (img or '')
-                log.debug(f'Downloading {display_save} from {self.board}/{self.thread_dir_name} (url: {link})')
-
-            if not self._wait_for_rate_limit():
-                return count + 1
-
-            data = self.http_client.fetch(link, retry_on_429=False)
-            data_hash = self.file_manager.compute_hash_bytes(data)
-
-            # Double-check after download
-            if data_hash in self.md5_hashes or self.db.has_hash(data_hash):
-                if self.config.verbose:
-                    log.debug(f'Duplicate found after download (MD5: {data_hash}), skipping {img or ""}')
-                return count + 1
-
-            # Save the file
-            self._save_file(img_path, data, data_hash, total, count)
-            count += 1
-
-            # Reaching here means the file survived both MD5 checks, so no
-            # ffmpeg process is ever spawned for a file MD5 already rejected.
-            self._phash_new_file(img_path)
-
-            # Delay between downloads
-            self._sleep(self.throttle)
-
-        except MaintenanceError:
-            raise
-        except (HTTPError, ThreadNotFoundError) as e:
-            if isinstance(e, HTTPError) and e.code == 429:
-                self._start_rate_limit_cooldown()
-            log.warning(f'Failed to download {link}: {e}')
-        except OSError as e:
-            if e.errno == 22:
-                # Fallback to simple filename if we hit an invalid argument error (e.g. filename too long or bad chars)
-                # Use tim + ext if available (guaranteed safe), otherwise use basename of img
-                link, img, api_md5_hex, api_md5_b64, original_name, tim, ext = (list(enum_tuple) + [None] * 7)[:7]
-                
-                if tim and ext:
-                    fallback_name = str(tim) + ext
-                elif img:
-                    fallback_name = os.path.basename(img)
-                else:
-                    fallback_name = f"fallback_{int(time.time())}"
-
-                fallback_path = os.path.join(self.directory, fallback_name)
-                if self.config.verbose:
-                    log.warning(f'Invalid filename "{os.path.basename(img_path)}", retrying with server name "{fallback_name}"')
-                try:
-                    self._save_file(fallback_path, data, data_hash, total, count)
-                    count += 1
-                except Exception as retry_e:
-                     log.warning(f'Failed to save fallback file {fallback_path}: {retry_e}')
-            else:
-                 log.warning(f'Unexpected error downloading {link}: {e}')
-        except Exception as e:
-            log.warning(f'Unexpected error downloading {link}: {e}')
-
-        return count
+        task = self.prepare_download_task(enum_tuple, enum_index, all_titles, total, count)
+        if task is not None:
+            self.execute_download_task(task)
+        return count + 1
 
     def _phash_new_file(self, img_path: str) -> None:
         """Compute and record the perceptual hash of a newly saved file.

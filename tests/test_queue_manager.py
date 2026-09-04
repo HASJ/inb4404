@@ -35,19 +35,25 @@ class TestQueueManager(unittest.TestCase):
         self.assertEqual(self.pm.rate_limit_until.value, 0.0)
 
     def test_start_watcher_passes_shared_rate_limit_to_child(self):
-        """New watcher processes receive the process-wide cooldown state."""
+        """New watcher instances receive the process-wide cooldown state."""
         link = "https://boards.4chan.org/gif/thread/1000"
         shared_rate_limit = object()
         self.pm.rate_limit_until = shared_rate_limit
 
-        with patch('inb4404.process_manager.Process') as process_class:
-            self.pm.start_watcher(link)
+        with patch('inb4404.queue_manager.ThreadWatcher') as mock_watcher_cls:
+            mock_watcher = MagicMock()
+            mock_watcher_cls.return_value = mock_watcher
+            watcher = self.pm.start_watcher(link)
 
-        process_args = process_class.call_args.kwargs['args']
-        self.assertEqual(
-            process_args,
-            (link, self.config, self.tmp_dir, self.pm.stop_event, shared_rate_limit),
+        mock_watcher_cls.assert_called_once_with(
+            link,
+            self.config,
+            self.tmp_dir,
+            stop_event=self.pm.stop_event,
+            raise_on_maintenance=True,
+            rate_limit_until=shared_rate_limit,
         )
+        self.assertEqual(watcher, mock_watcher)
 
     def test_handle_dead_process_restart_passes_shared_rate_limit_to_child(self):
         """Restarted watcher processes receive the process-wide cooldown state."""

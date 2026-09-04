@@ -8,6 +8,7 @@ from .config import Config
 from .database import HashDB
 from .thread_watcher import ThreadWatcher
 from .process_manager import ProcessManager
+from .queue_manager import QueueManager
 from .deduplicator import Deduplicator
 
 log = logging.getLogger('inb4404')
@@ -67,6 +68,8 @@ def create_config_from_args(args: argparse.Namespace) -> Config:
         maintenance_initial_wait=getattr(args, 'maintenance_initial_wait', 1800.0),
         maintenance_wait_increment=getattr(args, 'maintenance_wait_increment', 1800.0),
         maintenance_max_wait=getattr(args, 'maintenance_max_wait', 7200.0),
+        api_interval=getattr(args, 'api_interval', 1.0),
+        max_download_workers=getattr(args, 'download_workers', 1),
     )
 
 
@@ -194,6 +197,18 @@ def main() -> None:
         '--phash-distance', type=int, default=3,
         help='maximum Hamming distance for a near-duplicate frame pair (max 3)'
     )
+    parser.add_argument(
+        '--api-interval',
+        type=float,
+        default=1.0,
+        help='Minimum delay in seconds between thread API checks across all threads. Default: 1.0'
+    )
+    parser.add_argument(
+        '--download-workers',
+        type=int,
+        default=1,
+        help='Number of concurrent media download workers. Default: 1'
+    )
 
     args = parser.parse_args()
 
@@ -256,6 +271,7 @@ def main() -> None:
     else:
         # File containing thread URLs
         manager = ProcessManager(thread, config, config.workpath)
+        manager = QueueManager(thread, config, config.workpath)
         manager.run()
 
 
