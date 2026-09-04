@@ -5,7 +5,9 @@ import time
 import base64
 import logging
 import hashlib
+import threading
 from typing import List, Tuple, Optional, Set, Dict, Any
+
 
 from .config import Config, DEFAULT_RATE_LIMIT_WAIT, EXITCODE_MAINTENANCE
 from .database import HashDB
@@ -81,7 +83,42 @@ class ThreadWatcher:
         # Throttle (can be adjusted on 429)
         self.throttle = config.throttle
 
+        # Archived state tracking
+        self.is_archived: bool = False
+        self.has_completed_cycle: bool = False
+        self.last_item_count: int = 0
+        self.pending_tasks: int = 0
+        self._task_lock = threading.Lock()
+
         log.info(f'Watching {self.board}/{self.thread_id} (Dir: {self.thread_dir_name})')
+
+    def increment_pending_tasks(self, count: int = 1) -> None:
+        """Increment the count of pending download tasks for this thread."""
+        with self._task_lock:
+            self.pending_tasks += count
+
+    def decrement_pending_tasks(self, count: int = 1) -> None:
+        """Decrement the count of pending download tasks for this thread."""
+        with self._task_lock:
+            self.pending_tasks = max(0, self.pending_tasks - count)
+
+    def check_if_archived(self) -> bool:
+        """Check whether this thread is archived via cache or archive endpoint.
+
+        Returns:
+            True if the thread is archived, False otherwise.
+        """
+        if self.is_archived:
+            return True
+        try:
+            archived_ids = self.http_client.fetch_archive_api(self.board)
+            if archived_ids and int(self.thread_id) in archived_ids:
+                self.is_archived = True
+                return True
+        except Exception as e:
+            log.debug(f"Failed to check archive list for {self.board}/{self.thread_id}: {e}")
+        return False
+
 
     def _sleep(self, seconds: float) -> None:
         """Sleep for the specified number of seconds, or until stop_event is set.
@@ -245,6 +282,18 @@ class ThreadWatcher:
             self.md5_hashes.add(file_hash)
             self.db.upsert(file_hash, full_path, self.thread_id, mtime, size)
 
+    @staticmethod
+    def _is_html_archived(html_text: str) -> bool:
+        """Check if scraped HTML indicates the thread is archived."""
+        if not html_text:
+            return False
+        lower = html_text.lower()
+        return (
+            'thread archived' in lower
+            or 'thread_archived = true' in lower
+            or 'class="archivedicon"' in lower
+        )
+
     def _fetch_thread_data(self) -> Tuple[List[Tuple], List[str]]:
         """Fetch thread data and extract file entries.
 
@@ -260,6 +309,8 @@ class ThreadWatcher:
             thread_json = self.http_client.fetch_thread_api(self.board, self.thread_id)
             if thread_json:
                 posts = thread_json.get('posts', [])
+                if posts and posts[0].get('archived'):
+                    self.is_archived = True
                 file_entries = []
                 for p in posts:
                     if 'tim' in p and 'ext' in p and 'md5' in p:
@@ -286,6 +337,8 @@ class ThreadWatcher:
         # Fallback to HTML scraping
         try:
             html_result = self.http_client.fetch(self.thread_url).decode('utf-8')
+            if self._is_html_archived(html_result):
+                self.is_archived = True
             regex = r'(//i(?:s|)\d*\.(?:4cdn|4chan)\.org/\w+/(\d+\.(?:jpg|png|gif|webm|pdf|mp4)))'
             items = list(set(re.findall(regex, html_result)))
             items = sorted(items, key=lambda tup: tup[1])
@@ -299,6 +352,7 @@ class ThreadWatcher:
         except Exception as e:
             log.warning(f'Failed to fetch thread data: {e}')
             return ([], [])
+
 
     def _determine_file_path(
         self,
@@ -624,6 +678,16 @@ class ThreadWatcher:
                         break
                     count = self._process_file_entry(enum_tuple, enum_index, all_titles, total, count)
 
+                self.has_completed_cycle = True
+                self.last_item_count = total
+
+                if self.is_archived or self.check_if_archived():
+                    log.info(
+                        f"Thread {self.thread_url} is archived and all files downloaded/skipped. "
+                        f"Watcher exiting."
+                    )
+                    return
+
                 if maintenance_attempts > 0:
                     log.info(
                         f'Server maintenance is over for {self.board}/{self.thread_dir_name}. '
@@ -665,14 +729,29 @@ class ThreadWatcher:
                     self._sleep(sleep_time)
                     continue
 
+                if self.has_completed_cycle and (self.is_archived or self.check_if_archived()):
+                    log.info(
+                        f"Thread {self.thread_url} is archived and all files downloaded/skipped "
+                        f"(handled error: {ex}). Watcher exiting."
+                    )
+                    return
+
                 log.warning(f'Temporary error fetching {self.thread_url}: {ex}')
                 self._sleep(10)
                 continue
 
             except Exception as e:
+                if self.has_completed_cycle and (self.is_archived or self.check_if_archived()):
+                    log.info(
+                        f"Thread {self.thread_url} is archived and all files downloaded/skipped "
+                        f"(handled error: {e}). Watcher exiting."
+                    )
+                    return
+
                 log.warning(f'Unexpected error watching {self.thread_url}: {e}')
                 self._sleep(10)
                 continue
+
 
             if self.stop_event and self.stop_event.is_set():
                 break

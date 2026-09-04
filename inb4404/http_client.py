@@ -1,17 +1,49 @@
 """HTTP client for fetching thread data and files."""
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .exceptions import HTTPError, ThreadNotFoundError, MaintenanceError
 
 log = logging.getLogger('inb4404')
 
 MAINTENANCE_MESSAGE = "Performing maintenance. We'll be back soon."
+
+
+def is_getaddrinfo_error(error: Any) -> bool:
+    """Check if an error is a DNS / getaddrinfo resolution failure (e.g. Errno 11001).
+
+    Args:
+        error: The exception or error to inspect.
+
+    Returns:
+        True if the error indicates getaddrinfo failed, False otherwise.
+    """
+    if error is None:
+        return False
+    err_str = str(error).lower()
+    if (
+        'getaddrinfo failed' in err_str
+        or '11001' in err_str
+        or 'name or service not known' in err_str
+        or 'nodename nor servname' in err_str
+    ):
+        return True
+    reason = getattr(error, 'reason', None)
+    if reason is not None:
+        if is_getaddrinfo_error(reason):
+            return True
+        errno = getattr(reason, 'errno', None)
+        if errno in (11001, -2, -3):
+            return True
+    return False
+
 
 
 def is_maintenance_message(content: Any) -> bool:
@@ -59,6 +91,9 @@ class HTTPClient:
             stop_event: Optional threading/multiprocessing Event to signal shutdown.
         """
         self.stop_event = stop_event
+        self._archive_cache: Dict[str, Tuple[float, List[int]]] = {}
+        self._archive_lock = threading.Lock()
+
 
     def _sleep(self, seconds: float) -> None:
         """Sleep for specified seconds or until stop_event is set.
@@ -310,3 +345,62 @@ class HTTPClient:
                 last_error = e
 
         return None
+
+    def fetch_archive_api(
+        self,
+        board: str,
+        timeout: float = 15.0,
+        cache_ttl: float = 60.0,
+    ) -> Optional[List[int]]:
+        """Fetch the list of archived thread IDs for a board.
+
+        Checks 4chan's JSON archive endpoint (https://a.4cdn.org/{board}/archive.json)
+        and caches the result per board. Falls back to HTML scraping if the JSON
+        API request fails.
+
+        Args:
+            board: The board identifier (e.g., 'gif', 'g').
+            timeout: Timeout in seconds for the request (default: 15.0).
+            cache_ttl: Cache TTL in seconds to avoid frequent repeated requests (default: 60.0).
+
+        Returns:
+            A list of integer thread IDs in the archive, or None if unavailable.
+        """
+        now = time.time()
+        with self._archive_lock:
+            cached = self._archive_cache.get(board)
+            if cached and (now - cached[0] < cache_ttl):
+                return cached[1]
+
+        archive_url = f'https://a.4cdn.org/{board}/archive.json'
+        req = urllib.request.Request(archive_url, headers={'User-Agent': self.USER_AGENT})
+        try:
+            response = urllib.request.urlopen(req, timeout=timeout)
+            data = json.loads(response.read().decode('utf-8'))
+            if isinstance(data, list):
+                result = [int(tid) for tid in data if str(tid).isdigit()]
+                with self._archive_lock:
+                    self._archive_cache[board] = (now, result)
+                return result
+        except Exception as e:
+            log.debug(f"Failed to fetch archive JSON API for {board}: {e}")
+
+        # Fallback to scraping HTML archive if JSON API fails
+        try:
+            html_url = f'https://boards.4chan.org/{board}/archive'
+            html_bytes = self.fetch(html_url, max_retries=1, timeout=timeout)
+            html_str = html_bytes.decode('utf-8', errors='ignore')
+            import re
+            tids = re.findall(rf'/{board}/thread/(\d+)', html_str)
+            if not tids:
+                tids = re.findall(r'/(\d+)#', html_str)
+            if tids:
+                result = list({int(tid) for tid in tids})
+                with self._archive_lock:
+                    self._archive_cache[board] = (now, result)
+                return result
+        except Exception as e:
+            log.debug(f"Failed to scrape HTML archive for {board}: {e}")
+
+        return None
+

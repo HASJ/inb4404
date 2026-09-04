@@ -12,7 +12,7 @@ It is a fork of the original [4chan-downloader](https://github.com/Exceen/4chan-
 *   **Concurrent Downloading:** Supports watching multiple threads simultaneously via a queue file.
 *   **Consolidated Queue Architecture:** Monitors multiple threads in a single process with proactive API request pacing and a centralized media download queue, eliminating 429 bans and heavy multi-process overhead.
 *   **Interactive Management:** Add new threads to the watch list dynamically by pasting URLs into the console while the program is running.
-*   **Resilience:** Pauses all active watchers for 10 minutes after a media rate limit (HTTP 429) and gracefully manages dead threads (404s).
+*   **Resilience:** Pauses all active watchers for 10 minutes after a media rate limit (HTTP 429), gracefully manages dead threads (404s), and automatically discovers archived threads, retiring them once all media has finished downloading and gracefully handling DNS/network errors.
 *   **Flexible Naming:** Options to use original filenames, server filenames, or thread titles.
 *   **API-First:** Prioritizes the JSON API for performance, falling back to HTML scraping only when necessary.
 *   **Cross-Platform:** Pure Python implementation compatible with Windows, macOS, and Linux.
@@ -68,7 +68,7 @@ python inb4404.py queue.txt
 **Interactive Features:**
 *   **Hot Reloading:** Use the `-r` / `--reload` flag to make the script re-read the file every 5 minutes.
 *   **Dynamic Adding:** While running in list mode, you can paste a thread URL into the terminal and press Enter. The script will automatically add it to the queue file and start watching it immediately.
-*   **Dead Links:** If a thread 404s, the script will automatically comment it out in the file (prefixing with `-`).
+*   **Dead & Archived Links:** If a thread 404s, or is archived with all files already downloaded or skipped, the script will automatically comment it out in the queue file (prefixing with `-`).
 
 ### 3. Deduplication Mode
 Scan your existing `downloads/` directory to remove duplicate files, keeping only the oldest copy.
