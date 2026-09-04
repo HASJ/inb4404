@@ -22,6 +22,8 @@ DB_TIMEOUT = 30  # seconds
 DEFAULT_MAINTENANCE_INITIAL_WAIT = 1800.0  # seconds (30 minutes)
 DEFAULT_MAINTENANCE_WAIT_INCREMENT = 1800.0  # seconds (30 minutes)
 DEFAULT_MAINTENANCE_MAX_WAIT = 7200.0  # seconds (120 minutes)
+DEFAULT_API_INTERVAL = 1.0  # seconds between thread API checks across all threads
+DEFAULT_MAX_DOWNLOAD_WORKERS = 1  # number of media download workers
 EXITCODE_MAINTENANCE = 503
 
 
@@ -50,6 +52,8 @@ class Config:
     maintenance_initial_wait: float = DEFAULT_MAINTENANCE_INITIAL_WAIT
     maintenance_wait_increment: float = DEFAULT_MAINTENANCE_WAIT_INCREMENT
     maintenance_max_wait: float = DEFAULT_MAINTENANCE_MAX_WAIT
+    api_interval: float = DEFAULT_API_INTERVAL
+    max_download_workers: int = DEFAULT_MAX_DOWNLOAD_WORKERS
 
     def __post_init__(self):
         # If workpath was customized, but db_path is still pointing to the default_workpath hashes.db,

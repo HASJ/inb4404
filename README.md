@@ -10,6 +10,7 @@ It is a fork of the original [4chan-downloader](https://github.com/Exceen/4chan-
 *   **Intelligent Deduplication:** Uses MD5 hashing to maintain a global database of files. Prevents re-downloading identical files across different threads and can clean up existing archives.
 *   **Near-Duplicate Detection:** Perceptual hashing catches re-encodes, resizes and requantisations that MD5 cannot see. Nothing is deleted — the weaker copy is moved aside into an `original/` folder.
 *   **Concurrent Downloading:** Supports watching multiple threads simultaneously via a queue file.
+*   **Consolidated Queue Architecture:** Monitors multiple threads in a single process with proactive API request pacing and a centralized media download queue, eliminating 429 bans and heavy multi-process overhead.
 *   **Interactive Management:** Add new threads to the watch list dynamically by pasting URLs into the console while the program is running.
 *   **Resilience:** Pauses all active watchers for 10 minutes after a media rate limit (HTTP 429) and gracefully manages dead threads (404s).
 *   **Flexible Naming:** Options to use original filenames, server filenames, or thread titles.
@@ -119,6 +120,8 @@ live watching are logged and resolved on the next `--dedupe-downloads` run.
 | | `--throttle` | Seconds to wait between individual file downloads (default: 0.5). |
 | | `--backoff` | Delay in seconds by which media-download throttle increases after a thread-refresh 429; media 429s trigger the fixed global 10-minute cooldown. |
 | | `--dedupe-downloads` | Run the deduplication tool and exit. |
+| | `--api-interval` | Minimum delay in seconds between thread API checks across all threads (default: 1.0). |
+| | `--download-workers` | Number of concurrent media download workers (default: 1). |
 | | `--no-phash` | Disable perceptual near-duplicate detection. |
 | | `--phash-distance` | Max Hamming distance for a near-duplicate frame pair (default: 3, max: 3). |
 
